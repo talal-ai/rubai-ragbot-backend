@@ -1,0 +1,22 @@
+# Ignore files for Vercel deployment
+venv/
+env/
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.env
+.env.local
+.git/
+.gitignore
+test-doc/
+*.log
+.cursor/
+
