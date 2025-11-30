@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "buildCommand": "pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements-vercel.txt",
   "builds": [
     {
       "src": "api/index.py",
@@ -11,6 +12,12 @@
       "src": "/(.*)",
       "dest": "/api/index.py"
     }
-  ]
+  ],
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60,
+      "memory": 3008
+    }
+  }
 }
 

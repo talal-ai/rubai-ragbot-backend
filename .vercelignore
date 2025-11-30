@@ -20,3 +20,44 @@ test-doc/
 *.log
 .cursor/
 
+# Documentation and guides
+*.md
+!README.md
+VERCEL_DEPLOY.md
+RAG_GUIDE.md
+SUPABASE_SETUP.md
+
+# Migration files (not needed at runtime)
+migrations/
+*.sql
+
+# Scripts
+*.ps1
+*.sh
+*.bat
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+*_test.py
+test_*.py
+cleanup_tests.py
+
+# Setup files
+supabase_setup.sql
+supabase_auth_setup.sql
+add_user_id_migration.sql
+llamaindex_config.py
+list_models.py
+kill_port_8000.ps1
+start_server.ps1
+
