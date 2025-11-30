@@ -36,9 +36,6 @@ python-jose[cryptography]>=3.3.0
 # Supabase Storage - PHASE 2
 supabase>=2.4.0
 
-# Vercel/Serverless adapter
-mangum>=0.17.0
-
 # Optional: Development tools (uncomment for development)
 # pytest==8.3.3
 # pytest-asyncio==0.24.0
