@@ -57,7 +57,7 @@ class RAGService:
             database=parsed.path.lstrip('/'),  # Remove leading /
             host=parsed.hostname,
             password=parsed.password,
-            port=parsed.port or 5432,
+            port=str(parsed.port or 6543),  # type: ignore - Convert port to string for PGVectorStore
             user=parsed.username,
             table_name="documents",
             embed_dim=EMBEDDING_DIM,  # 768 for Gemini
@@ -151,7 +151,7 @@ class RAGService:
                 object.__setattr__(self, '_chat_id', chat_id)
             
             def _postprocess_nodes(
-                self, nodes: TypingList[NodeWithScore], query_bundle: QueryBundle = None
+                self, nodes: TypingList[NodeWithScore], query_bundle: QueryBundle
             ) -> TypingList[NodeWithScore]:
                 """Filter nodes based on upload_type and chat_id"""
                 filtered = []
@@ -186,7 +186,7 @@ class RAGService:
             
             # Use RAG mode with retrieval and post-processing
             chat_engine = index.as_chat_engine(
-                chat_mode="condense_plus_context",
+                chat_mode="condense_plus_context",  # type: ignore
                 memory=memory,
                 system_prompt=system_prompt or self._get_default_system_prompt(),
                 verbose=True,
@@ -400,7 +400,8 @@ reference the source number and page."""
         try:
             llm = Settings.llm
             response = llm.complete(full_prompt)
-            response_text = str(response)
+            # Access response text with proper fallback
+            response_text = getattr(response, 'text', str(response))  # type: ignore
         except Exception as e:
             logger.error(f"LLM generation error: {e}")
             response_text = "I apologize, but I encountered an error generating a response."
@@ -441,7 +442,7 @@ reference the source number and page."""
             try:
                 result = self.db.execute(
                     text("SELECT storage_url, metadata FROM documents WHERE filename = :filename LIMIT 1"),
-                    {"filename": chunk["filename"]}
+                    {"filename": source["filename"]}  # Use source not chunk
                 ).first()
                 if result:
                     # Try column first
@@ -619,7 +620,7 @@ Please answer based on the context provided above."""
             try:
                 result = self.db.execute(
                     text("SELECT storage_url, metadata FROM documents WHERE filename = :filename LIMIT 1"),
-                    {"filename": chunk["filename"]}
+                    {"filename": source["filename"]}  # Use source not chunk
                 ).first()
                 if result:
                     source["storage_url"] = result.storage_url

@@ -21,12 +21,14 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/rubai_db")
 
 # Create SQLAlchemy engine with connection pooling
+# Using Transaction mode (port 6543) for better connection limits
 engine = create_engine(
     DATABASE_URL,
-    pool_size=10,  # Number of connections to keep open
-    max_overflow=20,  # Additional connections if pool is full
+    pool_size=3,  # Reduced for Supabase free tier limits
+    max_overflow=5,  # Additional connections if pool is full
     pool_pre_ping=True,  # Verify connections before using
-    pool_recycle=3600,  # Recycle connections after 1 hour
+    pool_recycle=300,  # Recycle connections after 5 minutes (faster cycling)
+    pool_timeout=30,  # Timeout after 30 seconds if no connection available
     echo=False  # Set to True for SQL query logging
 )
 

@@ -23,16 +23,18 @@ VALID_CATEGORIES = ["privacy-policies", "cvs", "terms-and-conditions", "ai-docs"
 DEFAULT_CATEGORY = "ai-docs"
 
 # Initialize Supabase client
-_supabase_client: Optional[Client] = None
+_supabase_client: Optional["Client"] = None  # type: ignore
 
 
-def get_supabase_client() -> Client:
+def get_supabase_client() -> "Client":  # type: ignore
     """Get or create Supabase client singleton."""
     global _supabase_client
     if _supabase_client is None:
         if not SUPABASE_URL or not SUPABASE_ANON_KEY:
             raise ValueError("SUPABASE_URL and SUPABASE_ANON_KEY must be set")
-        _supabase_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+        if create_client is None:  # type: ignore
+            raise ImportError("supabase package not installed. Install with: pip install supabase")
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)  # type: ignore
     return _supabase_client
 
 
