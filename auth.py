@@ -21,7 +21,8 @@ from database import Base, get_db
 logger = logging.getLogger(__name__)
 
 # Configuration
-JWT_SECRET = os.getenv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production")
+# Use SUPABASE_JWT_SECRET for all JWT operations (same key used in main.py)
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", os.getenv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production"))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24 * 7  # 7 days
 

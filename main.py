@@ -169,6 +169,7 @@ class ChatMessage(BaseModel):
     attachment: Optional[Attachment] = None
     selected_documents: Optional[List[str]] = None  # Document filenames to search within
     category: Optional[str] = None  # Storage category to search within (privacy-policies, cvs, etc.)
+    knowledge_base_mode: Optional[str] = Field(default="none", description="Knowledge base access mode: 'none', 'folder', 'file', 'all'")
     chat_id: str = Field(..., min_length=1, description="Unique chat session identifier for conversation memory")  # NEW: Required for memory
     
     @validator('message')
@@ -598,24 +599,41 @@ async def remove_document(
     user_id: Optional[str] = Depends(get_supabase_user_id)
 ):
     """
-    Delete a document and all its chunks.
+    Delete a document and all its chunks from both database and Supabase storage.
     User can only delete their own documents or shared documents.
     """
     try:
         # Sanitize filename
         filename = sanitize_filename(filename)
         
+        # First, get document metadata to find category for storage deletion
+        from vector_store import get_document_metadata
+        doc_metadata = get_document_metadata(db, filename, user_id=user_id)
+        
+        if not doc_metadata:
+            raise HTTPException(status_code=404, detail="Document not found or you don't have permission to delete it")
+        
+        # Delete from Supabase storage if category is available
+        storage_deleted = False
+        if doc_metadata.get('category'):
+            from supabase_storage import delete_file_from_storage
+            storage_deleted, storage_message = delete_file_from_storage(filename, doc_metadata['category'])
+            if not storage_deleted:
+                logger.warning(f"Failed to delete from storage: {storage_message}")
+        
+        # Delete from database
         deleted_count = delete_document(db, filename, user_id=user_id)
         
         if deleted_count == 0:
             raise HTTPException(status_code=404, detail="Document not found or you don't have permission to delete it")
         
-        logger.info(f"Document deleted: {filename}, {deleted_count} chunks (user: {user_id})")
+        logger.info(f"Document deleted: {filename}, {deleted_count} chunks (user: {user_id}), storage: {'✓' if storage_deleted else '✗'}")
         
         return {
             "message": "Document deleted successfully",
             "filename": filename,
-            "chunks_deleted": deleted_count
+            "chunks_deleted": deleted_count,
+            "storage_deleted": storage_deleted
         }
     except HTTPException:
         raise
@@ -681,6 +699,7 @@ async def chat_with_rag(
             message=request.message,
             selected_documents=request.selected_documents,
             category=request.category,
+            knowledge_base_mode=request.knowledge_base_mode,
             system_prompt=system_prompt
         )
         
@@ -885,6 +904,7 @@ async def chat_with_rag_stream(
                 message=request.message,
                 selected_documents=request.selected_documents,
                 category=request.category,
+                knowledge_base_mode=request.knowledge_base_mode,
                 system_prompt=system_prompt
             ):
                 # Handle token streaming

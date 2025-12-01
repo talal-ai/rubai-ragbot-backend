@@ -4,34 +4,19 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 venv/
+env/
 ENV/
-.venv
-pip-log.txt
-pip-delete-this-directory.txt
 
 # Environment variables
 .env
-.env.local
-.env.*.local
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Project specific
-test-doc/
-*.log
-.cursor/
-
-# MCP config (contains sensitive tokens)
-.cursor/mcp.json
-

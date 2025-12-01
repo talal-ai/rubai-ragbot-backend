@@ -295,13 +295,17 @@ class RAGService:
         message: str,
         selected_documents: Optional[List[str]] = None,
         category: Optional[str] = None,
+        knowledge_base_mode: str = "none",
         system_prompt: Optional[str] = None
     ) -> tuple:
         """
         Chat with direct retrieval from our documents table (bypasses LlamaIndex PGVectorStore)
         
-        This method uses our existing search_similar_chunks function which queries
-        our documents table directly with proper Gemini embeddings (768-dim).
+        Knowledge Base Modes:
+        - "none": AI is completely blind, no document access
+        - "folder": Only search within specified category
+        - "file": Only search within selected document filenames
+        - "all": Search entire knowledge base
         
         Args:
             user_id: User identifier  
@@ -309,33 +313,58 @@ class RAGService:
             message: User message
             selected_documents: Optional list of documents to search within
             category: Optional category filter (privacy-policies, cvs, terms-and-conditions, ai-docs)
+            knowledge_base_mode: Knowledge base access mode
             system_prompt: Optional custom system prompt
         
         Returns:
             tuple: (response_text, sources_list)
         """
-        logger.info(f"[DIRECT RAG] Processing message: '{message[:50]}...'")
+        logger.info(f"[DIRECT RAG] Processing message: '{message[:50]}...' (mode: {knowledge_base_mode})")
         
-        # Step 1: Retrieve relevant context using our direct search
-        relevant_chunks = search_similar_chunks(
-            db=self.db,
-            query=message,
-            top_k=DEFAULT_TOP_K,
-            user_id=user_id,
-            filenames=selected_documents,
-            category=category
-        )
-        
-        logger.info(f"[DIRECT RAG] Retrieved {len(relevant_chunks)} relevant chunks")
-        
-        # Step 2: Build context from retrieved chunks
-        if relevant_chunks:
-            context_parts = []
-            for i, chunk in enumerate(relevant_chunks):
-                context_parts.append(f"[Source {i+1}: {chunk['filename']}, Page {chunk.get('page_number', 'N/A')}, Chunk {chunk['chunk_index']}]\n{chunk['content']}")
-            context = "\n\n---\n\n".join(context_parts)
+        # Handle different knowledge base modes
+        if knowledge_base_mode == "none":
+            # AI is completely blind - no document access
+            relevant_chunks = []
+            context = "No knowledge base access enabled. I can only respond based on my general knowledge."
         else:
-            context = "No relevant documents found."
+            # Step 1: Retrieve relevant context using our direct search
+            search_category = None
+            search_filenames = None
+            
+            if knowledge_base_mode == "folder" and category:
+                search_category = category
+            elif knowledge_base_mode == "file" and selected_documents:
+                search_filenames = selected_documents
+            elif knowledge_base_mode == "all":
+                # Search all documents (no filters)
+                pass
+            
+            relevant_chunks = search_similar_chunks(
+                db=self.db,
+                query=message,
+                top_k=DEFAULT_TOP_K,
+                user_id=user_id,
+                filenames=search_filenames,
+                category=search_category
+            )
+            
+            logger.info(f"[DIRECT RAG] Retrieved {len(relevant_chunks)} relevant chunks (mode: {knowledge_base_mode})")
+            
+            # Step 2: Build context from retrieved chunks
+            if relevant_chunks:
+                context_parts = []
+                for i, chunk in enumerate(relevant_chunks):
+                    context_parts.append(f"[Source {i+1}: {chunk['filename']}, Page {chunk.get('page_number', 'N/A')}, Chunk {chunk['chunk_index']}]\n{chunk['content']}")
+                context = "\n\n---\n\n".join(context_parts)
+            else:
+                if knowledge_base_mode == "all":
+                    context = "No relevant documents found in the knowledge base."
+                elif knowledge_base_mode == "folder":
+                    context = f"No relevant documents found in the {category} folder."
+                elif knowledge_base_mode == "file":
+                    context = f"No relevant documents found in the selected files."
+                else:
+                    context = "No relevant documents found."
         
         # Step 3: Build prompt with context
         base_system = system_prompt or self._get_default_system_prompt()
@@ -408,10 +437,17 @@ reference the source number and page."""
         message: str,
         selected_documents: Optional[List[str]] = None,
         category: Optional[str] = None,
+        knowledge_base_mode: str = "none",
         system_prompt: Optional[str] = None
     ) -> Generator[Dict, None, None]:
         """
         Streaming chat with direct retrieval (bypasses LlamaIndex PGVectorStore)
+        
+        Knowledge Base Modes:
+        - "none": AI is completely blind, no document access
+        - "folder": Only search within specified category
+        - "file": Only search within selected document filenames
+        - "all": Search entire knowledge base
         
         Args:
             user_id: User identifier
@@ -419,33 +455,59 @@ reference the source number and page."""
             message: User message
             selected_documents: Optional list of documents to search within
             category: Optional category filter (privacy-policies, cvs, terms-and-conditions, ai-docs)
+            knowledge_base_mode: Knowledge base access mode
+            system_prompt: Optional custom system prompt
             system_prompt: Optional custom system prompt
         
         Yields:
             Dict: Response with 'token' and optional 'sources'
         """
-        logger.info(f"[DIRECT RAG STREAM] Processing message: '{message[:50]}...'")
+        logger.info(f"[DIRECT RAG STREAM] Processing message: '{message[:50]}...' (mode: {knowledge_base_mode})")
         
-        # Step 1: Retrieve relevant context
-        relevant_chunks = search_similar_chunks(
-            db=self.db,
-            query=message,
-            top_k=DEFAULT_TOP_K,
-            user_id=user_id,
-            filenames=selected_documents,
-            category=category
-        )
-        
-        logger.info(f"[DIRECT RAG STREAM] Retrieved {len(relevant_chunks)} relevant chunks")
-        
-        # Step 2: Build context
-        if relevant_chunks:
-            context_parts = []
-            for i, chunk in enumerate(relevant_chunks):
-                context_parts.append(f"[Source {i+1}: {chunk['filename']}, Page {chunk.get('page_number', 'N/A')}]\n{chunk['content']}")
-            context = "\n\n---\n\n".join(context_parts)
+        # Handle different knowledge base modes
+        if knowledge_base_mode == "none":
+            # AI is completely blind - no document access
+            relevant_chunks = []
+            context = "No knowledge base access enabled. I can only respond based on my general knowledge."
         else:
-            context = "No relevant documents found."
+            # Step 1: Retrieve relevant context
+            search_category = None
+            search_filenames = None
+            
+            if knowledge_base_mode == "folder" and category:
+                search_category = category
+            elif knowledge_base_mode == "file" and selected_documents:
+                search_filenames = selected_documents
+            elif knowledge_base_mode == "all":
+                # Search all documents (no filters)
+                pass
+            
+            relevant_chunks = search_similar_chunks(
+                db=self.db,
+                query=message,
+                top_k=DEFAULT_TOP_K,
+                user_id=user_id,
+                filenames=search_filenames,
+                category=search_category
+            )
+            
+            logger.info(f"[DIRECT RAG STREAM] Retrieved {len(relevant_chunks)} relevant chunks (mode: {knowledge_base_mode})")
+            
+            # Step 2: Build context
+            if relevant_chunks:
+                context_parts = []
+                for i, chunk in enumerate(relevant_chunks):
+                    context_parts.append(f"[Source {i+1}: {chunk['filename']}, Page {chunk.get('page_number', 'N/A')}]\n{chunk['content']}")
+                context = "\n\n---\n\n".join(context_parts)
+            else:
+                if knowledge_base_mode == "all":
+                    context = "No relevant documents found in the knowledge base."
+                elif knowledge_base_mode == "folder":
+                    context = f"No relevant documents found in the {category} folder."
+                elif knowledge_base_mode == "file":
+                    context = f"No relevant documents found in the selected files."
+                else:
+                    context = "No relevant documents found."
         
         # Step 3: Build prompt
         base_system = system_prompt or self._get_default_system_prompt()

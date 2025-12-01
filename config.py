@@ -2,9 +2,13 @@
 Configuration settings for RubAI Backend
 """
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from backend directory
+backend_dir = Path(__file__).parent
+env_path = backend_dir / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # API Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")

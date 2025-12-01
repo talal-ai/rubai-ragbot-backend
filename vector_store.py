@@ -324,6 +324,42 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
         logger.error(f"Error getting documents: {e}")
         raise RuntimeError(f"Failed to retrieve documents: {str(e)}")
 
+def get_document_metadata(db: Session, filename: str, user_id: Optional[str] = None) -> Optional[Dict]:
+    """
+    Get metadata for a specific document.
+    
+    Args:
+        db: Database session
+        filename: Name of the document
+        user_id: Optional user ID filter
+        
+    Returns:
+        Document metadata dict or None if not found
+    """
+    try:
+        # Build query with user filter
+        query = db.query(Document).filter(Document.filename == filename)
+        if user_id:
+            query = query.filter((Document.user_id == user_id) | (Document.user_id == None))
+        
+        # Get first document to extract metadata
+        doc = query.first()
+        if not doc:
+            return None
+            
+        # Extract metadata
+        metadata = doc.doc_metadata or {}
+        return {
+            'category': metadata.get('category'),
+            'file_size': metadata.get('file_size'),
+            'file_type': metadata.get('file_type'),
+            'upload_type': metadata.get('upload_type'),
+            'storage_url': doc.storage_url
+        }
+    except Exception as e:
+        logger.error(f"Error getting document metadata for {filename}: {e}")
+        return None
+
 def delete_document(db: Session, filename: str, user_id: Optional[str] = None) -> int:
     """Delete all chunks of a document owned by the user"""
     try:

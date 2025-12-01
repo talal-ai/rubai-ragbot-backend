@@ -5,10 +5,14 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 import logging
 
-load_dotenv()
+# Load .env from backend directory
+backend_dir = Path(__file__).parent
+env_path = backend_dir / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
