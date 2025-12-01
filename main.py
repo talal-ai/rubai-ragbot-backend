@@ -539,6 +539,8 @@ async def upload_document(
                     chunk_index=chunk_idx,
                     page_number=page_num,
                     embedding=embedding,  # 768-dim Gemini embedding
+                    embedding_new=None,  # Explicitly set new embedding column to NULL
+                    text_id=None,  # LlamaIndex node ID (set later if needed)
                     storage_url=storage_url,  # Supabase Storage URL
                     doc_metadata=metadata
                 )
@@ -699,7 +701,7 @@ async def chat_with_rag(
             message=request.message,
             selected_documents=request.selected_documents,
             category=request.category,
-            knowledge_base_mode=request.knowledge_base_mode,
+            knowledge_base_mode=request.knowledge_base_mode or "none",
             system_prompt=system_prompt
         )
         
@@ -707,6 +709,10 @@ async def chat_with_rag(
         
         # **PHASE 2.3**: Sources are now extracted from LlamaIndex response
         # Only display sources if they exist and have metadata
+        
+        # Log source URLs for debugging citation links
+        for i, source in enumerate(sources):
+            logger.debug(f"Source {i+1}: {source.get('filename')} | Page: {source.get('page_number')} | URL: {source.get('storage_url', 'MISSING')}")
         
         return ChatResponse(
             response=response_text,
@@ -873,12 +879,13 @@ async def chat_with_rag_stream(
                     chunks = process_base64_attachment(base64_data, filename)
                     
                     # Add chunks to vector store
-                    rag_service.add_temporary_documents(
-                        chunks=chunks,
-                        filename=filename,
-                        user_id=effective_user_id,
-                        chat_id=request.chat_id
-                    )
+                    if effective_user_id:
+                        rag_service.add_temporary_documents(
+                            chunks=chunks,
+                            filename=filename,
+                            user_id=effective_user_id,
+                            chat_id=request.chat_id
+                        )
                     
                     logger.info(f"✅ Attachment processed: {len(chunks)} chunks added to vector store")
                     
@@ -904,7 +911,7 @@ async def chat_with_rag_stream(
                 message=request.message,
                 selected_documents=request.selected_documents,
                 category=request.category,
-                knowledge_base_mode=request.knowledge_base_mode,
+                knowledge_base_mode=request.knowledge_base_mode or "none",
                 system_prompt=system_prompt
             ):
                 # Handle token streaming
@@ -918,22 +925,25 @@ async def chat_with_rag_stream(
                 # Handle source citations
                 elif "sources" in data:
                     sources_list = data['sources']
-                    logger.info(f"Sending {len(sources_list)} source citations")
+                    logger.info(f"🔍 SOURCES DEBUG: Received {len(sources_list)} sources from RAG service")
+                    logger.info(f"🔍 SOURCES DEBUG: First source: {sources_list[0] if sources_list else 'None'}")
                     payload = json.dumps({'sources': sources_list})
+                    logger.info(f"🔍 SOURCES DEBUG: Sending payload: {payload[:200]}...")
                     yield f"data: {payload}\n\n"
             
             # PHASE 3: Synchronize with chat_sessions after streaming completes
             try:
-                await sync_chat_session(
-                    db=db,
-                    user_id=effective_user_id,
-                    chat_id=request.chat_id,
-                    user_message=request.message,
-                    ai_response=full_response,
-                    attachment=attachment_data,
-                    sources=sources_list,
-                    tone=request.tone
-                )
+                if effective_user_id:
+                    await sync_chat_session(
+                        db=db,
+                        user_id=effective_user_id,
+                        chat_id=request.chat_id,
+                        user_message=request.message,
+                        ai_response=full_response,
+                        attachment=attachment_data,
+                        sources=sources_list,
+                        tone=request.tone
+                    )
                 logger.info("✅ Chat session synchronized")
             except Exception as e:
                 logger.error(f"Error synchronizing chat session: {e}")
@@ -1265,6 +1275,70 @@ async def get_storage_file_url(category: str, filename: str):
     except Exception as e:
         logger.error(f"Get file URL error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get file URL")
+
+
+@app.get("/debug/sources/{filename}")
+async def debug_document_sources(
+    filename: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Debug endpoint to check source metadata for a specific document.
+    Shows what sources would be returned for citation links.
+    """
+    try:
+        result = db.execute(
+            text("""
+                SELECT 
+                    filename,
+                    chunk_index,
+                    page_number,
+                    storage_url,
+                    metadata,
+                    LEFT(content, 100) as content_preview
+                FROM documents
+                WHERE filename = :filename
+                ORDER BY chunk_index
+            """),
+            {"filename": filename}
+        )
+        
+        chunks = result.fetchall()
+        
+        if not chunks:
+            raise HTTPException(status_code=404, detail=f"Document '{filename}' not found")
+        
+        sources = []
+        for chunk in chunks:
+            source = {
+                "filename": chunk.filename,
+                "chunk_index": chunk.chunk_index,
+                "page_number": chunk.page_number,
+                "storage_url": chunk.storage_url,
+                "category": chunk.metadata.get("category") if chunk.metadata else None,
+                "content_preview": chunk.content_preview
+            }
+            sources.append(source)
+        
+        return {
+            "filename": filename,
+            "total_chunks": len(sources),
+            "sources": sources,
+            "unique_pages": list(set([s["page_number"] for s in sources if s["page_number"] is not None])),
+            "storage_url_status": {
+                "all_have_urls": all(s["storage_url"] for s in sources),
+                "missing_urls": sum(1 for s in sources if not s["storage_url"]),
+                "with_urls": sum(1 for s in sources if s["storage_url"])
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Debug sources error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to retrieve debug information")
 
 
 if __name__ == "__main__":

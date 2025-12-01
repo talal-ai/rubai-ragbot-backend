@@ -260,7 +260,7 @@ class RAGService:
                         "storage_url": metadata.get('storage_url')
                     }
                     
-                    # PHASE 4: If storage_url is missing, look it up from our documents table
+                    # PHASE 4 ENHANCED: Comprehensive storage_url enrichment with fallback
                     if not source_info.get("storage_url") and source_info.get("filename"):
                         try:
                             result = self.db.execute(
@@ -268,16 +268,34 @@ class RAGService:
                                 {"filename": source_info["filename"]}
                             ).first()
                             if result:
+                                # Try column first
                                 source_info["storage_url"] = result.storage_url
-                                # Also try to get from metadata if column is null
+                                
+                                # Fallback to metadata fields
                                 if not source_info["storage_url"] and result.metadata:
-                                    meta = result.metadata
+                                    meta = result.metadata if isinstance(result.metadata, dict) else {}
                                     source_info["storage_url"] = meta.get("storage_url") or meta.get("file_url")
-                                if not source_info.get("category") and result.metadata:
-                                    source_info["category"] = result.metadata.get("category")
-                                logger.debug(f"Enriched source {source_info['filename']} with storage_url from DB")
+                                    source_info["category"] = meta.get("category")
+                                
+                                # Last resort: construct URL from filename and category
+                                if not source_info["storage_url"]:
+                                    category = source_info.get("category") or "ai-docs"
+                                    from urllib.parse import quote
+                                    encoded_filename = quote(source_info["filename"])
+                                    source_info["storage_url"] = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/knowledge-base/{category}/{encoded_filename}"
+                                    logger.info(f"Constructed fallback URL for {source_info['filename']}: {source_info['storage_url']}")
+                                else:
+                                    logger.debug(f"Enriched {source_info['filename']} with storage_url from DB")
                         except Exception as e:
                             logger.warning(f"Could not enrich source metadata: {e}")
+                            # Try to construct URL anyway
+                            try:
+                                from urllib.parse import quote
+                                encoded_filename = quote(source_info["filename"])
+                                source_info["storage_url"] = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/knowledge-base/ai-docs/{encoded_filename}"
+                                logger.info(f"Using emergency fallback URL for {source_info['filename']}")
+                            except:
+                                pass
                     
                     sources.append(source_info)
                     logger.debug(f"Extracted source: {source_info['filename']}")
@@ -389,9 +407,10 @@ reference the source number and page."""
         
         # Step 5: Build sources with full metadata including storage_url
         # PHASE 5: Conditional Citations - only include high-relevance sources
-        HIGH_RELEVANCE_THRESHOLD = 0.5  # Only show sources with similarity > 50%
+        HIGH_RELEVANCE_THRESHOLD = 0.4  # Only show sources with similarity > 40%
         
-        sources = []
+        # Use a dict to deduplicate by (filename, page_number) - keep highest similarity
+        unique_sources = {}
         for chunk in relevant_chunks:
             similarity = chunk.get("similarity", 0)
             
@@ -400,34 +419,66 @@ reference the source number and page."""
                 logger.debug(f"Skipping low-relevance source: {chunk['filename']} (similarity={similarity:.2f})")
                 continue
             
-            source = {
-                "filename": chunk["filename"],
-                "page_number": chunk.get("page_number"),
-                "chunk_index": chunk["chunk_index"],
-                "similarity": similarity,
-                "text_snippet": chunk["content"][:200] if chunk.get("content") else ""
-            }
+            # Create unique key for this page
+            page_key = (chunk["filename"], chunk.get("page_number"))
             
-            # Get storage_url and category from database
+            # Only keep if this is the first occurrence or has higher similarity
+            if page_key not in unique_sources or similarity > unique_sources[page_key]["similarity"]:
+                source = {
+                    "filename": chunk["filename"],
+                    "page_number": chunk.get("page_number"),
+                    "chunk_index": chunk["chunk_index"],
+                    "similarity": similarity,
+                    "text_snippet": chunk["content"][:200] if chunk.get("content") else ""
+                }
+                unique_sources[page_key] = source
+        
+        # Convert back to list for processing
+        sources = []
+        for source in unique_sources.values():
+            
+            # Get storage_url and category from database with comprehensive fallback
             try:
                 result = self.db.execute(
                     text("SELECT storage_url, metadata FROM documents WHERE filename = :filename LIMIT 1"),
                     {"filename": chunk["filename"]}
                 ).first()
                 if result:
+                    # Try column first
                     source["storage_url"] = result.storage_url
+                    
+                    # Extract metadata
                     if result.metadata:
                         meta = result.metadata if isinstance(result.metadata, dict) else {}
+                        # Fallback to metadata if column is null
                         if not source["storage_url"]:
                             source["storage_url"] = meta.get("storage_url") or meta.get("file_url")
                         source["category"] = meta.get("category")
                         source["upload_type"] = meta.get("upload_type")
+                    
+                    # Last resort: construct URL from filename and category
+                    if not source["storage_url"]:
+                        category = source.get("category") or "ai-docs"
+                        from urllib.parse import quote
+                        encoded_filename = quote(chunk["filename"])
+                        source["storage_url"] = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/knowledge-base/{category}/{encoded_filename}"
+                        logger.info(f"Constructed fallback URL for {chunk['filename']}: {source['storage_url']}")
+                    else:
+                        logger.debug(f"Retrieved storage_url for {chunk['filename']}: {source['storage_url']}")
             except Exception as e:
                 logger.warning(f"Could not enrich source: {e}")
+                # Emergency fallback: construct URL with default category
+                try:
+                    from urllib.parse import quote
+                    encoded_filename = quote(chunk["filename"])
+                    source["storage_url"] = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/knowledge-base/ai-docs/{encoded_filename}"
+                    logger.info(f"Using emergency fallback URL for {chunk['filename']}")
+                except:
+                    pass
             
             sources.append(source)
         
-        logger.info(f"[DIRECT RAG] Response: {len(response_text)} chars, {len(sources)} high-relevance sources (threshold={HIGH_RELEVANCE_THRESHOLD})")
+        logger.info(f"[DIRECT RAG] Response: {len(response_text)} chars, {len(sources)} unique pages from {len(relevant_chunks)} chunks (threshold={HIGH_RELEVANCE_THRESHOLD})")
         return response_text, sources
 
     def chat_stream_direct(
@@ -534,9 +585,10 @@ Please answer based on the context provided above."""
         
         # Step 5: After streaming, yield sources
         # PHASE 5: Conditional Citations - only include high-relevance sources
-        HIGH_RELEVANCE_THRESHOLD = 0.5  # Only show sources with similarity > 50%
+        HIGH_RELEVANCE_THRESHOLD = 0.2  # Only show sources with similarity > 20%
         
-        sources = []
+        # Use a dict to deduplicate by (filename, page_number) - keep highest similarity
+        unique_sources = {}
         for chunk in relevant_chunks:
             similarity = chunk.get("similarity", 0)
             
@@ -545,13 +597,23 @@ Please answer based on the context provided above."""
                 logger.debug(f"Skipping low-relevance source: {chunk['filename']} (similarity={similarity:.2f})")
                 continue
             
-            source = {
-                "filename": chunk["filename"],
-                "page_number": chunk.get("page_number"),
-                "chunk_index": chunk["chunk_index"],
-                "similarity": similarity,
-                "text_snippet": chunk["content"][:200] if chunk.get("content") else ""
-            }
+            # Create unique key for this page
+            page_key = (chunk["filename"], chunk.get("page_number"))
+            
+            # Only keep if this is the first occurrence or has higher similarity
+            if page_key not in unique_sources or similarity > unique_sources[page_key]["similarity"]:
+                source = {
+                    "filename": chunk["filename"],
+                    "page_number": chunk.get("page_number"),
+                    "chunk_index": chunk["chunk_index"],
+                    "similarity": similarity,
+                    "text_snippet": chunk["content"][:200] if chunk.get("content") else ""
+                }
+                unique_sources[page_key] = source
+        
+        # Convert back to list for processing
+        sources = []
+        for source in unique_sources.values():
             
             # Enrich with storage_url
             try:
@@ -575,7 +637,7 @@ Please answer based on the context provided above."""
         if sources:
             yield {"sources": sources}
         
-        logger.info(f"[DIRECT RAG STREAM] Completed with {len(sources)} high-relevance sources")
+        logger.info(f"[DIRECT RAG STREAM] Completed with {len(sources)} unique pages from {len(relevant_chunks)} chunks (threshold={HIGH_RELEVANCE_THRESHOLD})")
 
     def chat_stream(
         self,

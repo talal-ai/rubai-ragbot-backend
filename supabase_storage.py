@@ -9,8 +9,13 @@ Handles file uploads to Supabase Storage with organized folder structure:
 """
 
 import os
-from typing import Optional, Tuple
-from supabase import create_client, Client
+from typing import Optional, Tuple, Any
+try:
+    from supabase import create_client, Client  # type: ignore
+except ImportError:
+    print("Warning: supabase package not installed. Install with: pip install supabase")
+    create_client = None  # type: ignore
+    Client = Any  # type: ignore
 from config import SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_STORAGE_BUCKET
 
 # Valid categories for knowledge base organization

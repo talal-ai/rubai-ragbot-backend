@@ -70,7 +70,7 @@ def delete_all_files():
         
         # Delete all documents
         result = db.execute(text('DELETE FROM documents'))
-        deleted_chunks = result.rowcount
+        deleted_chunks = result.rowcount if hasattr(result, 'rowcount') else 0  # type: ignore
         db.commit()
         
         print(f'Document chunks deleted from database: {deleted_chunks}')
