@@ -314,7 +314,8 @@ class RAGService:
         selected_documents: Optional[List[str]] = None,
         category: Optional[str] = None,
         knowledge_base_mode: str = "none",
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
+        language: Optional[str] = None
     ) -> tuple:
         """
         Chat with direct retrieval from our documents table (bypasses LlamaIndex PGVectorStore)
@@ -333,6 +334,7 @@ class RAGService:
             category: Optional category filter (privacy-policies, cvs, terms-and-conditions, ai-docs)
             knowledge_base_mode: Knowledge base access mode
             system_prompt: Optional custom system prompt
+            language: Optional language filter (en, ru, uz)
         
         Returns:
             tuple: (response_text, sources_list)
@@ -865,7 +867,8 @@ Please answer based on the context provided above."""
     
     def _get_default_system_prompt(self) -> str:
         """Get default system prompt for RubAI"""
-        return """You are RubAI, a sophisticated and determined AI solutions assistant.
+        return """You are RubAI RAGBot, a sophisticated and determined AI solutions assistant.
+You are currently operating in a limited testing mode.
 
 IMPORTANT CONTEXT HANDLING:
 - If document context is provided, use it to give accurate, sourced answers

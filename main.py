@@ -171,6 +171,7 @@ class ChatMessage(BaseModel):
     category: Optional[str] = None  # Storage category to search within (privacy-policies, cvs, etc.)
     knowledge_base_mode: Optional[str] = Field(default="none", description="Knowledge base access mode: 'none', 'folder', 'file', 'all'")
     chat_id: str = Field(..., min_length=1, description="Unique chat session identifier for conversation memory")  # NEW: Required for memory
+    language: Optional[str] = Field(default="en", description="Language preference for LLM responses: 'en', 'uz', 'ru'")
     
     @validator('message')
     def validate_message(cls, v):
@@ -579,6 +580,7 @@ async def upload_document(
 @app.get("/documents")
 async def list_documents(
     category: Optional[str] = Query(None),
+    language: Optional[str] = Query(None, description="Filter by language (en, ru, uz)"),
     db: Session = Depends(get_db),
     user_id: Optional[str] = Depends(get_supabase_user_id)
 ):
@@ -586,9 +588,10 @@ async def list_documents(
     Get list of all uploaded documents for the current user.
     Shows user's own documents plus shared documents (no owner).
     Optional category filter to show documents from specific folder.
+    Optional language filter to show only documents in a specific language.
     """
     try:
-        documents = get_all_documents(db, user_id=user_id, category=category)
+        documents = get_all_documents(db, user_id=user_id, category=category, language=language)
         return {"documents": documents, "count": len(documents)}
     except Exception as e:
         logger.error(f"List documents error: {e}")
@@ -601,12 +604,59 @@ async def remove_document(
     user_id: Optional[str] = Depends(get_supabase_user_id)
 ):
     """
-    Delete a document and all its chunks from both database and Supabase storage.
-    User can only delete their own documents or shared documents.
+    Delete a document:
+    - Personal documents: Hard delete (removes from DB and storage permanently)
+    - Global documents: Soft delete (hides from user's view only)
+    
+    Users can only delete their own personal documents.
+    Global documents (starter pack) can only be hidden, not deleted.
     """
     try:
         # Sanitize filename
         filename = sanitize_filename(filename)
+        
+        # Check ownership type and user permission
+        result = db.execute(
+            text("SELECT ownership_type, user_id FROM documents WHERE filename = :filename LIMIT 1"),
+            {"filename": filename}
+        ).first()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        ownership_type = result[0]
+        doc_user_id = result[1]
+        
+        # GLOBAL DOCUMENTS: Hide instead of delete
+        if ownership_type == 'global':
+            if not user_id:
+                raise HTTPException(status_code=401, detail="Authentication required to hide documents")
+                
+            # Hide the document for this user
+            db.execute(
+                text("""
+                    INSERT INTO user_document_visibility (user_id, filename, is_hidden, hidden_at)
+                    VALUES (:user_id, :filename, TRUE, NOW())
+                    ON CONFLICT (user_id, filename) 
+                    DO UPDATE SET is_hidden = TRUE, hidden_at = NOW()
+                """),
+                {"user_id": user_id, "filename": filename}
+            )
+            db.commit()
+            
+            logger.info(f"Global document hidden: {filename} (user: {user_id})")
+            return {
+                "message": "Document hidden from your view (global documents cannot be permanently deleted)",
+                "filename": filename,
+                "hidden": True,
+                "chunks_deleted": 0,
+                "storage_deleted": False
+            }
+        
+        # PERSONAL DOCUMENTS: Hard delete (existing logic)
+        # Verify user owns the document
+        if doc_user_id != user_id:
+            raise HTTPException(status_code=403, detail="You don't have permission to delete this document")
         
         # First, get document metadata to find category for storage deletion
         from vector_store import get_document_metadata
@@ -629,7 +679,7 @@ async def remove_document(
         if deleted_count == 0:
             raise HTTPException(status_code=404, detail="Document not found or you don't have permission to delete it")
         
-        logger.info(f"Document deleted: {filename}, {deleted_count} chunks (user: {user_id}), storage: {'✓' if storage_deleted else '✗'}")
+        logger.info(f"Personal document deleted: {filename}, {deleted_count} chunks (user: {user_id}), storage: {'✓' if storage_deleted else '✗'}")
         
         return {
             "message": "Document deleted successfully",
@@ -642,6 +692,99 @@ async def remove_document(
     except Exception as e:
         logger.error(f"Delete error: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete document")
+
+@app.post("/documents/hide")
+async def hide_document(
+    filename: str = Query(...),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_supabase_user)
+):
+    """
+    Hide a global document from user's view (soft delete).
+    Only works for global documents (starter pack).
+    Personal documents should be deleted permanently using DELETE endpoint.
+    """
+    try:
+        # Sanitize filename
+        filename = sanitize_filename(filename)
+        
+        # Check if document exists and is global
+        result = db.execute(
+            text("SELECT ownership_type FROM documents WHERE filename = :filename LIMIT 1"),
+            {"filename": filename}
+        ).first()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        if result[0] != 'global':
+            raise HTTPException(
+                status_code=400, 
+                detail="Can only hide global documents. Use DELETE endpoint for personal documents."
+            )
+        
+        # Insert or update visibility record
+        db.execute(
+            text("""
+                INSERT INTO user_document_visibility (user_id, filename, is_hidden, hidden_at)
+                VALUES (:user_id, :filename, TRUE, NOW())
+                ON CONFLICT (user_id, filename) 
+                DO UPDATE SET is_hidden = TRUE, hidden_at = NOW()
+            """),
+            {"user_id": user_id, "filename": filename}
+        )
+        db.commit()
+        
+        logger.info(f"Document hidden: {filename} (user: {user_id})")
+        return {
+            "message": f"Document '{filename}' hidden from your view",
+            "filename": filename,
+            "is_hidden": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Hide document error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to hide document")
+
+
+@app.post("/documents/unhide")
+async def unhide_document(
+    filename: str = Query(...),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_supabase_user)
+):
+    """
+    Restore a hidden global document to user's view.
+    """
+    try:
+        # Sanitize filename
+        filename = sanitize_filename(filename)
+        
+        # Update visibility record
+        db.execute(
+            text("""
+                UPDATE user_document_visibility
+                SET is_hidden = FALSE, hidden_at = NULL
+                WHERE user_id = :user_id AND filename = :filename
+            """),
+            {"user_id": user_id, "filename": filename}
+        )
+        db.commit()
+        
+        logger.info(f"Document unhidden: {filename} (user: {user_id})")
+        return {
+            "message": f"Document '{filename}' restored to your view",
+            "filename": filename,
+            "is_hidden": False
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Unhide document error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to unhide document")
 
 @app.post("/search")
 async def search_documents(
@@ -691,8 +834,16 @@ async def chat_with_rag(
         # Initialize RAG service
         rag_service = RAGService(db)
         
-        # Build system prompt with tone
-        system_prompt = f"[System: Respond in a {request.tone} tone]\n\n{rag_service._get_default_system_prompt()}"
+        # Map language codes to full names
+        language_names = {
+            'en': 'English',
+            'uz': 'Uzbek',
+            'ru': 'Russian'
+        }
+        language_name = language_names.get(request.language or 'en', 'English')
+        
+        # Build system prompt with tone and language
+        system_prompt = f"[System: Respond in a {request.tone} tone. IMPORTANT: Please respond in {language_name} language.]\n\n{rag_service._get_default_system_prompt()}"
         
         # Chat with direct retrieval (uses our vector_store search, not LlamaIndex PGVectorStore)
         response_text, sources = rag_service.chat_direct(
@@ -702,7 +853,8 @@ async def chat_with_rag(
             selected_documents=request.selected_documents,
             category=request.category,
             knowledge_base_mode=request.knowledge_base_mode or "none",
-            system_prompt=system_prompt
+            system_prompt=system_prompt,
+            language=request.language
         )
         
         logger.info(f"✅ RAG response generated with direct retrieval and {len(sources)} sources")
@@ -900,8 +1052,16 @@ async def chat_with_rag_stream(
                     # Continue without attachment rather than failing completely
                     yield f"data: {json.dumps({'text': '[Note: Could not process attachment] '})}\n\n"
             
-            # Build system prompt with tone
-            system_prompt = f"[System: Respond in a {request.tone} tone]\n\n{rag_service._get_default_system_prompt()}"
+            # Map language codes to full names
+            language_names = {
+                'en': 'English',
+                'uz': 'Uzbek',
+                'ru': 'Russian'
+            }
+            language_name = language_names.get(request.language, 'English')
+            
+            # Build system prompt with tone and language
+            system_prompt = f"[System: Respond in a {request.tone} tone. IMPORTANT: Please respond in {language_name} language.]\n\n{rag_service._get_default_system_prompt()}"
             
             # Stream response with direct retrieval (uses our vector_store, not LlamaIndex PGVectorStore)
             token_count = 0
@@ -925,10 +1085,8 @@ async def chat_with_rag_stream(
                 # Handle source citations
                 elif "sources" in data:
                     sources_list = data['sources']
-                    logger.info(f"🔍 SOURCES DEBUG: Received {len(sources_list)} sources from RAG service")
-                    logger.info(f"🔍 SOURCES DEBUG: First source: {sources_list[0] if sources_list else 'None'}")
+                    logger.info(f"Sending {len(sources_list)} source citations")
                     payload = json.dumps({'sources': sources_list})
-                    logger.info(f"🔍 SOURCES DEBUG: Sending payload: {payload[:200]}...")
                     yield f"data: {payload}\n\n"
             
             # PHASE 3: Synchronize with chat_sessions after streaming completes

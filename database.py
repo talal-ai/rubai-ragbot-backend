@@ -49,6 +49,7 @@ class Document(Base):
     embedding_new = Column(Vector(1024), nullable=True)  # BGE-large embeddings (1024-dim) - ACTIVE
     text_id = Column(String(255), nullable=True, index=True)  # LlamaIndex node ID
     storage_url = Column(String(2048), nullable=True)  # Supabase Storage file URL
+    ownership_type = Column(String(20), server_default='personal', nullable=False)  # 'global' or 'personal'
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
     doc_metadata = Column('metadata', JSONB, server_default='{}', nullable=False)
     

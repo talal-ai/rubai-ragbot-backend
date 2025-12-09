@@ -116,7 +116,8 @@ def search_similar_chunks(
     page_filter: int = None,
     user_id: Optional[str] = None,
     filenames: Optional[List[str]] = None,
-    category: Optional[str] = None
+    category: Optional[str] = None,
+    language: Optional[str] = None
 ) -> List[Dict]:
     """
     Search for similar document chunks using vector similarity
@@ -131,6 +132,7 @@ def search_similar_chunks(
         user_id: Optional user ID to filter documents (if None, searches all docs)
         filenames: Optional list of filenames to search within (for chat context isolation)
         category: Optional filter by storage category (privacy-policies, cvs, terms-and-conditions, ai-docs)
+        language: Optional filter by language (en, ru, uz)
     
     Returns:
         List of similar chunks with metadata including page numbers
@@ -155,10 +157,24 @@ def search_similar_chunks(
             "limit": top_k
         }
         
-        # Filter by user_id if provided
+        # Filter by user_id and ownership_type with visibility check
         if user_id:
-            where_clauses.append("(user_id = :user_id OR user_id IS NULL)")
+            # User can see:
+            # 1. Their own personal documents (ownership_type='personal' AND user_id=current_user)
+            # 2. Global documents NOT hidden by them (ownership_type='global' AND user_id IS NULL AND not in visibility table)
+            where_clauses.append("""(
+                (ownership_type = 'personal' AND user_id = :user_id)
+                OR
+                (ownership_type = 'global' AND user_id IS NULL
+                 AND filename NOT IN (
+                     SELECT filename FROM user_document_visibility 
+                     WHERE user_id = :user_id AND is_hidden = TRUE
+                 ))
+            )""")
             params["user_id"] = user_id
+        else:
+            # Anonymous users only see global documents
+            where_clauses.append("ownership_type = 'global' AND user_id IS NULL")
         
         if filename_filter:
             where_clauses.append("filename = :filename")
@@ -179,6 +195,11 @@ def search_similar_chunks(
         if category:
             where_clauses.append("metadata->>'category' = :category")
             params["category"] = category
+        
+        # Filter by language if provided
+        if language:
+            where_clauses.append("metadata->>'language' = :language")
+            params["language"] = language
         
         where_sql = " AND ".join(where_clauses)
         
@@ -219,13 +240,14 @@ def search_similar_chunks(
         db.rollback()
         raise RuntimeError(f"Search failed: {str(e)}")
 
-def get_all_documents(db: Session, user_id: Optional[str] = None, category: Optional[str] = None) -> List[Dict]:
+def get_all_documents(db: Session, user_id: Optional[str] = None, category: Optional[str] = None, language: Optional[str] = None) -> List[Dict]:
     """
     Get list of all unique documents with full metadata for a user.
     
     Args:
         user_id: Optional user ID to filter documents
         category: Optional category filter (privacy-policies, cvs, terms-and-conditions, ai-docs)
+        language: Optional language filter (en, ru, uz)
     
     Returns documents with:
     - filename, chunk_count, uploaded_at (basic info)
@@ -236,24 +258,50 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
     - upload_type: Type of upload (knowledge_base, attachment)
     """
     try:
-        # Build where clause for user and category filtering
+        # Build where clause for user, category, and ownership filtering
         where_clauses = []
         params = {}
+        
         if user_id:
-            where_clauses.append("(d.user_id = :user_id OR d.user_id IS NULL)")
+            # User can see:
+            # 1. Their own personal documents
+            # 2. Global documents NOT hidden by them
+            where_clauses.append("""(
+                (d.ownership_type = 'personal' AND d.user_id = :user_id)
+                OR
+                (d.ownership_type = 'global' AND d.user_id IS NULL
+                 AND d.filename NOT IN (
+                     SELECT filename FROM user_document_visibility 
+                     WHERE user_id = :user_id AND is_hidden = TRUE
+                 ))
+            )""")
             params["user_id"] = user_id
+        else:
+            # Anonymous users only see global documents
+            where_clauses.append("d.ownership_type = 'global' AND d.user_id IS NULL")
+            
         if category:
             where_clauses.append("d.metadata->>'category' = :category")
             params["category"] = category
         
+        if language:
+            where_clauses.append("d.metadata->>'language' = :language")
+            params["language"] = language
+        
         user_filter = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
         
-        # Use a subquery to get the first metadata and storage_url for each file
+        # Use a subquery to get metadata, storage_url, ownership_type, and visibility status
         sql = text(f"""
             SELECT 
                 d.filename, 
                 COUNT(*) as chunk_count, 
                 MAX(d.created_at) as uploaded_at,
+                MAX(d.ownership_type) as ownership_type,
+                COALESCE(
+                    (SELECT is_hidden FROM user_document_visibility 
+                     WHERE user_id = :user_id AND filename = d.filename LIMIT 1),
+                    FALSE
+                ) as is_hidden,
                 (
                     SELECT metadata 
                     FROM documents 
@@ -280,7 +328,9 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
                 "filename": row[0],
                 "chunk_count": row[1],
                 "uploaded_at": str(row[2]),
-                "storage_url": row[4],  # Direct from storage_url column
+                "ownership_type": row[3],  # 'global' or 'personal'
+                "is_hidden": row[4],  # TRUE if user has hidden this global doc
+                "storage_url": row[6],  # Direct from storage_url column
                 "category": None,
                 "file_size": None,
                 "file_type": None,
@@ -288,9 +338,9 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
             }
             
             # Extract metadata fields
-            if row[3]:
+            if row[5]:
                 try:
-                    meta = row[3]
+                    meta = row[5]
                     # Storage URL (fallback to metadata if column is null)
                     if not doc['storage_url'] and 'storage_url' in meta:
                         doc['storage_url'] = meta['storage_url']
