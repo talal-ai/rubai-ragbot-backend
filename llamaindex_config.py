@@ -61,25 +61,70 @@ def get_llm():
     llm_provider = os.getenv("LLM_PROVIDER", "gemini").lower()
     
     if llm_provider == "ollama":
-        try:
-            from llama_index.llms.ollama import Ollama
-            logger.info("Initializing Ollama LLM...")
+        logger.info("Initializing Ollama LLM (using custom wrapper)...")
+        
+        ollama_api_key = os.getenv("OLLAMA_API_KEY")
+        if not ollama_api_key:
+            raise ValueError("OLLAMA_API_KEY not found in environment variables")
+        
+        ollama_model = os.getenv("OLLAMA_MODEL", "ministral-3:8b-cloud")
+        ollama_base_url = os.getenv("OLLAMA_API_BASE_URL", "https://ollama.com/api")
+        
+        # Create Ollama provider first (outside Pydantic model)
+        from llm_provider import create_llm_provider
+        ollama_provider = create_llm_provider("ollama", api_key=ollama_api_key, model=ollama_model, base_url=ollama_base_url)
+        
+        # Create custom LlamaIndex LLM wrapper for Ollama Cloud
+        from llama_index.core.llms import CustomLLM, CompletionResponse, CompletionResponseGen, LLMMetadata
+        
+        # Use closure to capture provider and model_name
+        def create_ollama_llm(provider, model_name):
+            class OllamaCloudLLM(CustomLLM):
+                """Custom LlamaIndex LLM wrapper for Ollama Cloud API"""
+                
+                def __init__(self, **kwargs):
+                    super().__init__(**kwargs)
+                    # Store values directly in __dict__ to bypass Pydantic validation
+                    object.__setattr__(self, '_provider', provider)
+                    object.__setattr__(self, '_model_name', model_name)
+                
+                @property
+                def metadata(self) -> LLMMetadata:
+                    # Access via object.__getattribute__ to bypass Pydantic's __getattr__
+                    try:
+                        model_name = object.__getattribute__(self, '_model_name')
+                    except AttributeError:
+                        model_name = 'ollama'
+                    return LLMMetadata(
+                        context_window=8000,
+                        num_output=1024,
+                        model_name=model_name,
+                    )
+                
+                def complete(self, prompt: str, **kwargs) -> CompletionResponse:
+                    """Non-streaming completion"""
+                    provider = object.__getattribute__(self, '_provider')
+                    response_text = provider.generate_content(prompt, **kwargs)
+                    return CompletionResponse(text=response_text)
+                
+                def stream_complete(self, prompt: str, **kwargs) -> CompletionResponseGen:
+                    """Streaming completion"""
+                    provider = object.__getattribute__(self, '_provider')
+                    def gen() -> CompletionResponseGen:
+                        for chunk in provider.generate_content_stream(prompt, **kwargs):
+                            yield CompletionResponse(text=chunk, delta=chunk)
+                    return gen()
             
-            ollama_api_key = os.getenv("OLLAMA_API_KEY")
-            if not ollama_api_key:
-                raise ValueError("OLLAMA_API_KEY not found in environment variables")
-            
-            llm = Ollama(
-                model=os.getenv("OLLAMA_MODEL", "qwen3-coder:480b-cloud"),
-                api_key=ollama_api_key,
-                base_url=os.getenv("OLLAMA_API_BASE_URL", "https://ollama.com/api"),
-                temperature=0.7,
-            )
-            
-            logger.info(f"✅ Ollama LLM initialized: {os.getenv('OLLAMA_MODEL', 'qwen3-coder:480b-cloud')}")
-            return llm
-        except ImportError:
-            logger.warning("llama_index.llms.ollama not available, falling back to Gemini")
+            return OllamaCloudLLM
+        
+        OllamaCloudLLMClass = create_ollama_llm(ollama_provider, ollama_model)
+        
+        llm = OllamaCloudLLMClass(
+            temperature=0.7,
+        )
+        
+        logger.info(f"✅ Ollama LLM initialized: {ollama_model}")
+        return llm
     
     # Gemini (default or fallback)
     from llama_index.llms.gemini import Gemini
@@ -125,7 +170,7 @@ def init_llamaindex():
     Settings.chunk_overlap = 250
     
     # Set context window based on provider
-    if llm_provider == "ollama" and hasattr(Settings.llm, "__class__") and Settings.llm.__class__.__name__ == "Ollama":
+    if llm_provider == "ollama":
         Settings.context_window = 8000   # Ollama context window
         Settings.num_output = 1024       # Max output tokens for Ollama
         logger.info("✅ LlamaIndex initialized successfully")

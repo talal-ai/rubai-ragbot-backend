@@ -158,7 +158,8 @@ def search_similar_chunks(
         }
         
         # Filter by user_id and ownership_type with visibility check
-        if user_id:
+        # Admin users (user_id == "admin") see all documents
+        if user_id and user_id != "admin":
             # User can see:
             # 1. Their own personal documents (ownership_type='personal' AND user_id=current_user)
             # 2. Global documents NOT hidden by them (ownership_type='global' AND user_id IS NULL AND not in visibility table)
@@ -172,6 +173,10 @@ def search_similar_chunks(
                  ))
             )""")
             params["user_id"] = user_id
+        elif user_id == "admin":
+            # Admin users see all documents (no filter)
+            logger.info("Admin user - showing all documents")
+            pass
         else:
             # Anonymous users only see global documents
             where_clauses.append("ownership_type = 'global' AND user_id IS NULL")
@@ -196,9 +201,9 @@ def search_similar_chunks(
             where_clauses.append("metadata->>'category' = :category")
             params["category"] = category
         
-        # Filter by language if provided
+        # Filter by language if provided (include NULL language for user uploads)
         if language:
-            where_clauses.append("metadata->>'language' = :language")
+            where_clauses.append("(metadata->>'language' = :language OR metadata->>'language' IS NULL)")
             params["language"] = language
         
         where_sql = " AND ".join(where_clauses)
@@ -245,7 +250,7 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
     Get list of all unique documents with full metadata for a user.
     
     Args:
-        user_id: Optional user ID to filter documents
+        user_id: Optional user ID to filter documents (if "admin", shows all documents)
         category: Optional category filter (privacy-policies, cvs, terms-and-conditions, ai-docs)
         language: Optional language filter (en, ru, uz)
     
@@ -258,11 +263,14 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
     - upload_type: Type of upload (knowledge_base, attachment)
     """
     try:
+        # Admin users (user_id == "admin") see all documents - treat as None
+        effective_user_id = None if user_id == "admin" else user_id
+        
         # Build where clause for user, category, and ownership filtering
         where_clauses = []
         params = {}
         
-        if user_id:
+        if effective_user_id:
             # User can see:
             # 1. Their own personal documents
             # 2. Global documents NOT hidden by them
@@ -275,20 +283,34 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
                      WHERE user_id = :user_id AND is_hidden = TRUE
                  ))
             )""")
-            params["user_id"] = user_id
+            params["user_id"] = effective_user_id
         else:
-            # Anonymous users only see global documents
-            where_clauses.append("d.ownership_type = 'global' AND d.user_id IS NULL")
+            # Anonymous users or admin users see all documents (no filter)
+            # Admin users bypass all filters to see everything
+            pass
             
         if category:
             where_clauses.append("d.metadata->>'category' = :category")
             params["category"] = category
         
         if language:
-            where_clauses.append("d.metadata->>'language' = :language")
+            # Show documents that match the language OR have no language (user uploads)
+            where_clauses.append("(d.metadata->>'language' = :language OR d.metadata->>'language' IS NULL)")
             params["language"] = language
         
         user_filter = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        
+        # Build SQL query - conditionally include user_id in visibility subquery
+        visibility_subquery = ""
+        if effective_user_id:
+            visibility_subquery = """COALESCE(
+                    (SELECT is_hidden FROM user_document_visibility 
+                     WHERE user_id = :user_id AND filename = d.filename LIMIT 1),
+                    FALSE
+                ) as is_hidden"""
+        else:
+            # For admin/anonymous, always show as not hidden
+            visibility_subquery = "FALSE as is_hidden"
         
         # Use a subquery to get metadata, storage_url, ownership_type, and visibility status
         sql = text(f"""
@@ -297,11 +319,7 @@ def get_all_documents(db: Session, user_id: Optional[str] = None, category: Opti
                 COUNT(*) as chunk_count, 
                 MAX(d.created_at) as uploaded_at,
                 MAX(d.ownership_type) as ownership_type,
-                COALESCE(
-                    (SELECT is_hidden FROM user_document_visibility 
-                     WHERE user_id = :user_id AND filename = d.filename LIMIT 1),
-                    FALSE
-                ) as is_hidden,
+                {visibility_subquery},
                 (
                     SELECT metadata 
                     FROM documents 
@@ -381,16 +399,20 @@ def get_document_metadata(db: Session, filename: str, user_id: Optional[str] = N
     Args:
         db: Database session
         filename: Name of the document
-        user_id: Optional user ID filter
-        
+        user_id: Optional user ID filter (if "admin", allows access to any document)
+    
     Returns:
         Document metadata dict or None if not found
     """
     try:
+        # Admin users (user_id == "admin") can access any document - treat as None
+        effective_user_id = None if user_id == "admin" else user_id
+        
         # Build query with user filter
         query = db.query(Document).filter(Document.filename == filename)
-        if user_id:
-            query = query.filter((Document.user_id == user_id) | (Document.user_id == None))
+        if effective_user_id:
+            query = query.filter((Document.user_id == effective_user_id) | (Document.user_id == None))
+        # If effective_user_id is None (admin or anonymous), don't filter by user_id
         
         # Get first document to extract metadata
         doc = query.first()
@@ -411,16 +433,23 @@ def get_document_metadata(db: Session, filename: str, user_id: Optional[str] = N
         return None
 
 def delete_document(db: Session, filename: str, user_id: Optional[str] = None) -> int:
-    """Delete all chunks of a document owned by the user"""
+    """
+    Delete all chunks of a document owned by the user.
+    Admin users (user_id == "admin") can delete any document.
+    """
     try:
         if not filename or not filename.strip():
             raise ValueError("Filename cannot be empty")
         
+        # Admin users (user_id == "admin") can delete any document - treat as None
+        effective_user_id = None if user_id == "admin" else user_id
+        
         # Build query with user filter
         query = db.query(Document).filter(Document.filename == filename)
-        if user_id:
+        if effective_user_id:
             # Only delete if user owns the document or it's a shared document (no owner)
-            query = query.filter((Document.user_id == user_id) | (Document.user_id == None))
+            query = query.filter((Document.user_id == effective_user_id) | (Document.user_id == None))
+        # If effective_user_id is None (admin), don't filter by user_id - can delete any document
         
         deleted = query.delete(synchronize_session=False)
         db.commit()

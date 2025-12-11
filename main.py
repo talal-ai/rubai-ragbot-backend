@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import os
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
@@ -29,10 +29,12 @@ from supabase_storage import VALID_CATEGORIES, list_files_in_category
 
 # Import auth module
 from auth import (
-    GoogleAuthRequest, TokenResponse, User,
+    GoogleAuthRequest, TokenResponse, User, AdminLoginRequest, UnifiedLoginRequest,
     verify_google_token, get_user_by_google_id, get_user_by_email,
+    get_user_by_username, verify_password, hash_password, is_admin,
     create_user, update_user, user_to_dict,
-    get_current_user, get_current_user_optional, create_access_token
+    get_current_user, get_current_user_optional, create_access_token,
+    get_user_by_email_or_username
 )
 
 # Load environment variables
@@ -64,6 +66,7 @@ async def get_supabase_user_id(authorization: Optional[str] = Header(None)) -> O
     Extract user_id from Supabase JWT token in Authorization header.
     Returns None if no valid token is provided (allows anonymous access).
     Verifies JWT signature if SUPABASE_JWT_SECRET is configured.
+    Also checks for admin JWT tokens (from our backend auth).
     """
     if not authorization:
         return None
@@ -75,7 +78,25 @@ async def get_supabase_user_id(authorization: Optional[str] = Header(None)) -> O
         else:
             token = authorization
         
-        # If JWT secret is configured, verify the token properly
+        # First, try to decode as admin token (uses our JWT_SECRET)
+        try:
+            from auth import JWT_SECRET, JWT_ALGORITHM, verify_token
+            payload = verify_token(token)
+            if payload:
+                # Check if this is an admin token (has role='admin')
+                if payload.get("role") == "admin":
+                    logger.info(f"Admin user detected from token: {payload.get('email')}")
+                    # Return a special marker for admin users
+                    return "admin"
+                # If it's our backend token but not admin, extract user_id
+                user_id = payload.get("sub")
+                if user_id:
+                    logger.info(f"Backend user token detected: {user_id}")
+                    return user_id
+        except:
+            pass
+        
+        # If JWT secret is configured, verify the token properly (Supabase token)
         if SUPABASE_JWT_SECRET:
             try:
                 payload = jwt.decode(
@@ -86,7 +107,9 @@ async def get_supabase_user_id(authorization: Optional[str] = Header(None)) -> O
                 )
                 user_id = payload.get("sub")
                 if user_id:
-                    logger.debug(f"Verified user_id from Supabase token: {user_id}")
+                    logger.info(f"Verified user_id from Supabase token: {user_id} (type: {type(user_id)})")
+                else:
+                    logger.warning(f"No 'sub' claim found in JWT payload. Available keys: {list(payload.keys())}")
                 return user_id
             except ExpiredSignatureError:
                 logger.warning("JWT token has expired")
@@ -113,21 +136,48 @@ async def get_supabase_user_id(authorization: Optional[str] = Header(None)) -> O
             
             user_id = payload.get("sub")
             if user_id:
-                logger.debug(f"Extracted user_id from Supabase token (unverified): {user_id}")
+                logger.info(f"Extracted user_id from Supabase token (unverified): {user_id} (type: {type(user_id)})")
+            else:
+                logger.warning(f"No 'sub' claim found in JWT payload. Available keys: {list(payload.keys())}")
             return user_id
     except Exception as e:
         logger.warning(f"Failed to extract user_id from token: {e}")
         return None
 
 
+async def is_admin_user(authorization: Optional[str] = Header(None)) -> bool:
+    """Check if the current user is an admin from JWT token"""
+    if not authorization:
+        return False
+    
+    try:
+        from auth import verify_token
+        token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+        payload = verify_token(token)
+        return payload and payload.get("role") == "admin"
+    except:
+        return False
+
+
 async def require_supabase_user(authorization: Optional[str] = Header(None)) -> str:
     """
     Require a valid Supabase user. Raises 401 if not authenticated.
+    Admin users are allowed (they return "admin" string).
     """
     user_id = await get_supabase_user_id(authorization)
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
     return user_id
+
+def get_admin_chat_user_id(admin_user_id: str) -> str:
+    """
+    Convert admin user_id to a UUID for chat_sessions table.
+    Uses a consistent UUID based on admin identifier.
+    All admin users share the same chat sessions UUID.
+    """
+    # Use a fixed UUID for all admin users: 00000000-0000-0000-0000-000000000001
+    # This allows admin chat sessions to be stored in chat_sessions table
+    return "00000000-0000-0000-0000-000000000001"
 
 app = FastAPI(  # type: ignore[call-arg]
     title="RubAI Backend API",
@@ -330,10 +380,10 @@ async def google_auth(request: GoogleAuthRequest, db: Session = Depends(get_db))
                 avatar_url=google_user.get("avatar_url")
             )
         
-        # Create JWT token
-        access_token = create_access_token(str(user.id), str(user.email))
+        # Create JWT token with role
+        access_token = create_access_token(str(user.id), str(user.email), user.role)
         
-        logger.info(f"User authenticated: {user.email}")
+        logger.info(f"User authenticated: {user.email} (role: {user.role})")
         
         return TokenResponse(
             access_token=access_token,
@@ -361,6 +411,110 @@ async def logout():
     Logout endpoint (client should clear token)
     """
     return {"message": "Logged out successfully"}
+
+
+@app.post("/auth/admin/login", response_model=TokenResponse)
+async def admin_login(request: AdminLoginRequest, db: Session = Depends(get_db)):
+    """
+    Admin login endpoint
+    Authenticate admin users with username and password
+    """
+    try:
+        # Find user by username
+        user = get_user_by_username(db, request.username)
+        
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password"
+            )
+        
+        # Check if user is admin
+        if user.role != 'admin':
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied. Admin privileges required."
+            )
+        
+        # Verify password
+        if not user.password_hash:
+            raise HTTPException(
+                status_code=401,
+                detail="Password not set for this admin account"
+            )
+        
+        if not verify_password(request.password, user.password_hash):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password"
+            )
+        
+        # Create JWT token with admin role
+        access_token = create_access_token(str(user.id), str(user.email), user.role)
+        
+        logger.info(f"Admin authenticated: {user.username} ({user.email})")
+        
+        return TokenResponse(
+            access_token=access_token,
+            user=user_to_dict(user)
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin login error: {e}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def unified_login(request: UnifiedLoginRequest, db: Session = Depends(get_db)):
+    """
+    Unified login endpoint that auto-detects admin vs regular users.
+    - If email/username is an admin: authenticates with password hash and returns admin token
+    - If not admin: returns error indicating to use Supabase auth (frontend handles this)
+    This keeps the role separation hidden from users.
+    """
+    try:
+        # Check if user exists by email or username
+        user = get_user_by_email_or_username(db, request.email_or_username)
+        
+        # If user exists and is admin, authenticate as admin
+        if user and user.role == 'admin':
+            # Verify password
+            if not user.password_hash:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid email or password"
+                )
+            
+            if not verify_password(request.password, user.password_hash):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid email or password"
+                )
+            
+            # Create admin JWT token
+            access_token = create_access_token(str(user.id), str(user.email), user.role)
+            
+            logger.info(f"Admin authenticated via unified login: {user.username or user.email}")
+            
+            return TokenResponse(
+                access_token=access_token,
+                user=user_to_dict(user)
+            )
+        
+        # If not admin, return error that frontend will catch and use Supabase auth
+        # We use a generic error message so users don't know about role separation
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unified login error: {e}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -428,7 +582,8 @@ async def upload_document(
     file: UploadFile = File(...),
     category: str = Query("privacy-policies", description="Document category: privacy-policies, cvs, terms-and-conditions, ai-docs"),
     db: Session = Depends(get_db),
-    user_id: Optional[str] = Depends(get_supabase_user_id)
+    user_id: Optional[str] = Depends(get_supabase_user_id),
+    authorization: Optional[str] = Header(None)
 ):
     """
     Upload and process a document (PDF or TXT).
@@ -459,11 +614,20 @@ async def upload_document(
         # Sanitize filename
         filename = sanitize_filename(file.filename or "document.pdf")
         
-        # If this document is already in the knowledge base for this user, skip heavy work
-        if user_id:
+        # Check document upload limit for authenticated users (skip for admin)
+        if user_id and user_id != "admin":
+            is_allowed, error_msg, current_count = check_document_upload_limit(db, user_id, upload_limit=3, authorization=authorization)
+            if not is_allowed:
+                logger.warning(f"Document upload limit reached for user {user_id}: {current_count} documents")
+                raise HTTPException(status_code=429, detail=error_msg or "Document upload limit reached")
+        
+        # Admin users store documents as global (user_id=NULL), so check for existing global documents
+        # Regular users check for their own documents
+        effective_user_id = None if user_id == "admin" else user_id
+        if effective_user_id:
             existing = db.execute(
                 text("SELECT 1 FROM documents WHERE filename = :filename AND user_id = :user_id LIMIT 1"),
-                {"filename": filename, "user_id": user_id}
+                {"filename": filename, "user_id": effective_user_id}
             ).first()
         else:
             existing = db.execute(
@@ -533,8 +697,10 @@ async def upload_document(
                 embedding = generate_embedding(chunk_text)
                 
                 # Store in database with 768-dim embedding and storage_url
+                # Admin users store documents as global (user_id=NULL)
+                doc_user_id = None if user_id == "admin" else user_id
                 doc = Document(
-                    user_id=user_id,
+                    user_id=doc_user_id,
                     filename=filename,
                     content=chunk_text,
                     chunk_index=chunk_idx,
@@ -553,6 +719,10 @@ async def upload_document(
         
         db.commit()
         store_time = time.time() - store_start
+        
+        # Increment document count after successful upload (skip for admin)
+        if user_id and user_id != "admin":
+            increment_document_count(db, user_id)
         
         total_time = time.time() - start_time
         
@@ -582,19 +752,26 @@ async def list_documents(
     category: Optional[str] = Query(None),
     language: Optional[str] = Query(None, description="Filter by language (en, ru, uz)"),
     db: Session = Depends(get_db),
-    user_id: Optional[str] = Depends(get_supabase_user_id)
+    user_id: Optional[str] = Depends(get_supabase_user_id),
+    authorization: Optional[str] = Header(None)
 ):
     """
     Get list of all uploaded documents for the current user.
     Shows user's own documents plus shared documents (no owner).
+    Admin users see all documents.
     Optional category filter to show documents from specific folder.
     Optional language filter to show only documents in a specific language.
     """
     try:
-        documents = get_all_documents(db, user_id=user_id, category=category, language=language)
+        # Admin users see all documents (pass None to get_all_documents)
+        # Also handle case where user_id is "admin" string
+        effective_user_id = None if (await is_admin_user(authorization) or user_id == "admin") else user_id
+        documents = get_all_documents(db, user_id=effective_user_id, category=category, language=language)
         return {"documents": documents, "count": len(documents)}
     except Exception as e:
         logger.error(f"List documents error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail="Failed to retrieve documents")
 
 @app.delete("/documents/{filename}")
@@ -612,8 +789,14 @@ async def remove_document(
     Global documents (starter pack) can only be hidden, not deleted.
     """
     try:
+        # URL decode filename if needed (FastAPI should do this, but ensure it's decoded)
+        import urllib.parse
+        filename = urllib.parse.unquote(filename)
+        
         # Sanitize filename
         filename = sanitize_filename(filename)
+        
+        logger.info(f"Delete request for filename: '{filename}' (user: {user_id})")
         
         # Check ownership type and user permission
         result = db.execute(
@@ -622,48 +805,83 @@ async def remove_document(
         ).first()
         
         if not result:
+            logger.warning(f"Document not found: '{filename}'")
             raise HTTPException(status_code=404, detail="Document not found")
         
         ownership_type = result[0]
         doc_user_id = result[1]
         
-        # GLOBAL DOCUMENTS: Hide instead of delete
-        if ownership_type == 'global':
-            if not user_id:
-                raise HTTPException(status_code=401, detail="Authentication required to hide documents")
+        logger.info(f"Document found: ownership_type={ownership_type}, doc_user_id={doc_user_id}, request_user_id={user_id}")
+        
+        # Require authentication for any delete operation
+        if not user_id:
+            logger.warning(f"Unauthenticated user attempted to delete document: {filename}")
+            raise HTTPException(status_code=401, detail="Authentication required to delete documents")
+        
+        # Admin users can delete any document (bypass ownership checks)
+        is_admin = (user_id == "admin")
+        
+        if not is_admin:
+            # GLOBAL DOCUMENTS: Hide instead of delete (for regular users)
+            if ownership_type == 'global':
+                # Hide the document for this user
+                db.execute(
+                    text("""
+                        INSERT INTO user_document_visibility (user_id, filename, is_hidden, hidden_at)
+                        VALUES (:user_id, :filename, TRUE, NOW())
+                        ON CONFLICT (user_id, filename) 
+                        DO UPDATE SET is_hidden = TRUE, hidden_at = NOW()
+                    """),
+                    {"user_id": user_id, "filename": filename}
+                )
+                db.commit()
                 
-            # Hide the document for this user
-            db.execute(
-                text("""
-                    INSERT INTO user_document_visibility (user_id, filename, is_hidden, hidden_at)
-                    VALUES (:user_id, :filename, TRUE, NOW())
-                    ON CONFLICT (user_id, filename) 
-                    DO UPDATE SET is_hidden = TRUE, hidden_at = NOW()
-                """),
-                {"user_id": user_id, "filename": filename}
-            )
-            db.commit()
+                logger.info(f"Global document hidden: {filename} (user: {user_id})")
+                return {
+                    "message": "Document hidden from your view (global documents cannot be permanently deleted)",
+                    "filename": filename,
+                    "hidden": True,
+                    "chunks_deleted": 0,
+                    "storage_deleted": False
+                }
             
-            logger.info(f"Global document hidden: {filename} (user: {user_id})")
-            return {
-                "message": "Document hidden from your view (global documents cannot be permanently deleted)",
-                "filename": filename,
-                "hidden": True,
-                "chunks_deleted": 0,
-                "storage_deleted": False
-            }
+            # PERSONAL DOCUMENTS: Hard delete (existing logic)
+            # Verify user owns the document
+            # Convert both to strings for comparison (in case of UUID type mismatch)
+            doc_user_id_str = str(doc_user_id) if doc_user_id else None
+            user_id_str = str(user_id) if user_id else None
+            
+            if doc_user_id_str != user_id_str:
+                logger.warning(f"Permission denied: doc_user_id={doc_user_id_str} (type: {type(doc_user_id)}), request_user_id={user_id_str} (type: {type(user_id)}), filename={filename}")
+                raise HTTPException(status_code=403, detail="You don't have permission to delete this document")
+            
+            logger.info(f"Permission granted: user {user_id_str} owns document {filename}")
         
-        # PERSONAL DOCUMENTS: Hard delete (existing logic)
-        # Verify user owns the document
-        if doc_user_id != user_id:
-            raise HTTPException(status_code=403, detail="You don't have permission to delete this document")
-        
+        # Admin users can delete any document, regular users can only delete their own
         # First, get document metadata to find category for storage deletion
         from vector_store import get_document_metadata
         doc_metadata = get_document_metadata(db, filename, user_id=user_id)
         
         if not doc_metadata:
             raise HTTPException(status_code=404, detail="Document not found or you don't have permission to delete it")
+        
+        # Get text_ids (node_ids) for this document BEFORE deleting (for LlamaIndex cleanup)
+        node_ids = []
+        try:
+            # For admin, get all text_ids regardless of user_id
+            if is_admin:
+                result = db.execute(
+                    text("SELECT text_id FROM documents WHERE filename = :filename AND text_id IS NOT NULL"),
+                    {"filename": filename}
+                )
+            else:
+                result = db.execute(
+                    text("SELECT text_id FROM documents WHERE filename = :filename AND user_id = :user_id AND text_id IS NOT NULL"),
+                    {"filename": filename, "user_id": user_id}
+                )
+            node_ids = [row[0] for row in result.fetchall() if row[0]]
+        except Exception as e:
+            logger.warning(f"Failed to get node_ids for LlamaIndex cleanup (non-critical): {e}")
         
         # Delete from Supabase storage if category is available
         storage_deleted = False
@@ -673,11 +891,29 @@ async def remove_document(
             if not storage_deleted:
                 logger.warning(f"Failed to delete from storage: {storage_message}")
         
-        # Delete from database
-        deleted_count = delete_document(db, filename, user_id=user_id)
+        # Delete from database (chunks) - pass None for admin to allow deletion of any document
+        effective_user_id = None if is_admin else user_id
+        deleted_count = delete_document(db, filename, user_id=effective_user_id)
         
         if deleted_count == 0:
             raise HTTPException(status_code=404, detail="Document not found or you don't have permission to delete it")
+        
+        # Also delete from LlamaIndex data_documents table if nodes exist
+        if node_ids:
+            try:
+                db.execute(
+                    text("DELETE FROM data_documents WHERE node_id = ANY(:node_ids)"),
+                    {"node_ids": node_ids}
+                )
+                db.commit()
+                logger.info(f"Deleted {len(node_ids)} LlamaIndex nodes for document: {filename}")
+            except Exception as e:
+                logger.warning(f"Failed to delete LlamaIndex nodes (non-critical): {e}")
+                # Don't fail the whole operation if LlamaIndex cleanup fails
+        
+        # Decrement document count after successful deletion (skip for admin)
+        if user_id and user_id != "admin":
+            decrement_document_count(db, user_id)
         
         logger.info(f"Personal document deleted: {filename}, {deleted_count} chunks (user: {user_id}), storage: {'✓' if storage_deleted else '✗'}")
         
@@ -807,7 +1043,8 @@ async def search_documents(
 async def chat_with_rag(
     request: ChatMessage,
     db: Session = Depends(get_db),
-    user_id: Optional[str] = Depends(get_supabase_user_id)
+    user_id: Optional[str] = Depends(get_supabase_user_id),
+    authorization: Optional[str] = Header(None)
 ):
     """
     Chat with RAG using LlamaIndex with conversation memory.
@@ -831,6 +1068,16 @@ async def chat_with_rag(
         # This allows the SQL query to match user_id IS NULL for public documents
         effective_user_id = user_id  # None for anonymous, UUID string for authenticated
         
+        # Check message limit for authenticated users (skip for admin)
+        if effective_user_id and effective_user_id != "admin":
+            is_allowed, cooldown_msg, current_count = check_message_limit(db, effective_user_id, daily_limit=20, authorization=authorization)
+            if not is_allowed:
+                logger.warning(f"Message limit reached for user {effective_user_id}: {current_count} messages today")
+                raise HTTPException(status_code=429, detail=cooldown_msg or "Daily message limit reached")
+            
+            # Increment message count before processing (skip for admin)
+            increment_message_count(db, effective_user_id)
+        
         # Initialize RAG service
         rag_service = RAGService(db)
         
@@ -843,11 +1090,22 @@ async def chat_with_rag(
         language_name = language_names.get(request.language or 'en', 'English')
         
         # Build system prompt with tone and language
-        system_prompt = f"[System: Respond in a {request.tone} tone. IMPORTANT: Please respond in {language_name} language.]\n\n{rag_service._get_default_system_prompt()}"
+        language_instruction = ""
+        if request.language == 'uz':
+            language_instruction = f"\n\nCRITICAL LANGUAGE REQUIREMENT: You MUST respond entirely in Uzbek (O'zbek tili). All text, explanations, and responses must be in Uzbek. Do not mix languages."
+        elif request.language == 'ru':
+            language_instruction = f"\n\nCRITICAL LANGUAGE REQUIREMENT: You MUST respond entirely in Russian (Русский язык). All text, explanations, and responses must be in Russian. Do not mix languages."
+        elif request.language == 'en':
+            language_instruction = f"\n\nCRITICAL LANGUAGE REQUIREMENT: You MUST respond entirely in English. All text, explanations, and responses must be in English."
+        
+        system_prompt = f"[System: Respond in a {request.tone} tone. IMPORTANT: Please respond in {language_name} language.]{language_instruction}\n\n{rag_service._get_default_system_prompt()}"
         
         # Chat with direct retrieval (uses our vector_store search, not LlamaIndex PGVectorStore)
+        # For admin users, pass "admin" to search_similar_chunks so it shows all documents
+        # search_similar_chunks already handles "admin" correctly (shows all docs, respects filters)
+        rag_user_id = effective_user_id  # Keep "admin" as-is for search_similar_chunks
         response_text, sources = rag_service.chat_direct(
-            user_id=effective_user_id,
+            user_id=rag_user_id,
             chat_id=request.chat_id,
             message=request.message,
             selected_documents=request.selected_documents,
@@ -866,6 +1124,25 @@ async def chat_with_rag(
         for i, source in enumerate(sources):
             logger.debug(f"Source {i+1}: {source.get('filename')} | Page: {source.get('page_number')} | URL: {source.get('storage_url', 'MISSING')}")
         
+        # PHASE 3: Synchronize with chat_sessions after response
+        # Convert admin user_id to UUID for chat_sessions table
+        try:
+            if effective_user_id:
+                sync_user_id = get_admin_chat_user_id(effective_user_id) if effective_user_id == "admin" else effective_user_id
+                await sync_chat_session(
+                    db=db,
+                    user_id=sync_user_id,
+                    chat_id=request.chat_id,
+                    user_message=request.message,
+                    ai_response=response_text,
+                    sources=sources if sources else None,
+                    tone=request.tone
+                )
+                logger.info("✅ Chat session synchronized")
+        except Exception as e:
+            logger.error(f"Error synchronizing chat session: {e}")
+            # Don't fail the whole request, just log the error
+        
         return ChatResponse(
             response=response_text,
             sources=sources
@@ -876,6 +1153,340 @@ async def chat_with_rag(
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail="Failed to generate RAG response")
+
+
+# ==================== DOCUMENT UPLOAD LIMIT MANAGEMENT ====================
+
+def check_document_upload_limit(db: Session, user_id: str, upload_limit: int = 3, authorization: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[int]]:
+    """
+    Check if user has reached document upload limit.
+    Admin users bypass the limit.
+    
+    Args:
+        db: Database session
+        user_id: User identifier (Supabase UUID)
+        upload_limit: Maximum documents per user (default: 3)
+        authorization: Optional Authorization header to check for admin role
+        
+    Returns:
+        tuple: (is_allowed, error_message, current_count)
+        - is_allowed: True if user can upload document, False if limit reached
+        - error_message: Message to display if limit reached
+        - current_count: Current document count
+    """
+    if not user_id:
+        # Anonymous users: no limit (or implement separate logic if needed)
+        return True, None, None
+    
+    # Check if user is admin (from token or user_id marker)
+    if user_id == "admin":
+        logger.info(f"Admin user bypassing document upload limit")
+        return True, None, None
+    
+    # Check if user is admin from JWT token
+    if authorization:
+        try:
+            from auth import verify_token
+            token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+            payload = verify_token(token)
+            if payload and payload.get("role") == "admin":
+                logger.info(f"Admin user bypassing document upload limit")
+                return True, None, None
+        except Exception as e:
+            logger.debug(f"Could not check admin status from token: {e}")
+    
+    try:
+        # Get current document count
+        result = db.execute(
+            text("""
+                SELECT document_count 
+                FROM user_document_counts 
+                WHERE user_id = :user_id
+            """),
+            {"user_id": user_id}
+        )
+        row = result.fetchone()
+        current_count = row[0] if row else 0
+        
+        # Check if limit reached
+        if current_count >= upload_limit:
+            error_msg = f"You've reached your document upload limit of {upload_limit} documents. Please delete some documents before uploading new ones."
+            return False, error_msg, current_count
+        
+        return True, None, current_count
+        
+    except Exception as e:
+        # Check if it's a table doesn't exist error
+        error_str = str(e).lower()
+        if "does not exist" in error_str or "relation" in error_str or "undefinedtable" in error_str:
+            logger.warning(f"⚠️ user_document_counts table does not exist. Please run the migration: backend/migrations/add_document_upload_limit.sql")
+            logger.warning(f"   Document uploads will work but won't be counted until migration is applied.")
+        else:
+            logger.error(f"Error checking document upload limit: {e}")
+        # On error, allow the upload (fail open) - don't block users if table doesn't exist
+        return True, None, None
+
+
+def increment_document_count(db: Session, user_id: str) -> int:
+    """
+    Increment document count for user.
+    
+    Args:
+        db: Database session
+        user_id: User identifier
+        
+    Returns:
+        int: New document count after increment
+    """
+    if not user_id:
+        return 0
+    
+    try:
+        # Use PostgreSQL function to increment count atomically
+        result = db.execute(
+            text("SELECT increment_document_count(:user_id)"),
+            {"user_id": user_id}
+        )
+        new_count = result.scalar()
+        db.commit()
+        logger.info(f"Document count incremented for user {user_id}: {new_count} documents")
+        return new_count or 0
+    except Exception as e:
+        db.rollback()
+        # Check if it's a table doesn't exist error
+        error_str = str(e).lower()
+        if "does not exist" in error_str or "relation" in error_str or "undefinedtable" in error_str:
+            logger.warning(f"⚠️ user_document_counts table does not exist. Document counting disabled until migration is run.")
+            return 0
+        
+        logger.error(f"Error incrementing document count: {e}")
+        # Try fallback: direct insert/update
+        try:
+            result = db.execute(
+                text("""
+                    INSERT INTO user_document_counts (user_id, document_count, last_upload_at)
+                    VALUES (:user_id, 1, NOW())
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET 
+                        document_count = user_document_counts.document_count + 1,
+                        last_upload_at = NOW(),
+                        updated_at = NOW()
+                    RETURNING document_count
+                """),
+                {"user_id": user_id}
+            )
+            new_count = result.scalar()
+            db.commit()
+            return new_count or 0
+        except Exception as e2:
+            db.rollback()
+            error_str2 = str(e2).lower()
+            if "does not exist" in error_str2 or "relation" in error_str2 or "undefinedtable" in error_str2:
+                logger.warning(f"⚠️ user_document_counts table does not exist. Document counting disabled.")
+            else:
+                logger.error(f"Fallback increment also failed: {e2}")
+            return 0
+
+
+def decrement_document_count(db: Session, user_id: str) -> int:
+    """
+    Decrement document count for user (when document is deleted).
+    
+    Args:
+        db: Database session
+        user_id: User identifier
+        
+    Returns:
+        int: New document count after decrement
+    """
+    if not user_id:
+        return 0
+    
+    try:
+        # Use PostgreSQL function to decrement count atomically
+        result = db.execute(
+            text("SELECT decrement_document_count(:user_id)"),
+            {"user_id": user_id}
+        )
+        new_count = result.scalar()
+        db.commit()
+        logger.info(f"Document count decremented for user {user_id}: {new_count} documents")
+        return new_count or 0
+    except Exception as e:
+        db.rollback()
+        # Check if it's a table doesn't exist error
+        error_str = str(e).lower()
+        if "does not exist" in error_str or "relation" in error_str or "undefinedtable" in error_str:
+            logger.warning(f"⚠️ user_document_counts table does not exist. Document counting disabled.")
+            return 0
+        
+        logger.error(f"Error decrementing document count: {e}")
+        # Try fallback: direct update
+        try:
+            result = db.execute(
+                text("""
+                    UPDATE user_document_counts
+                    SET document_count = GREATEST(document_count - 1, 0),
+                        updated_at = NOW()
+                    WHERE user_id = :user_id
+                    RETURNING document_count
+                """),
+                {"user_id": user_id}
+            )
+            row = result.fetchone()
+            db.commit()
+            return row[0] if row else 0
+        except Exception as e2:
+            db.rollback()
+            error_str2 = str(e2).lower()
+            if "does not exist" in error_str2 or "relation" in error_str2 or "undefinedtable" in error_str2:
+                logger.warning(f"⚠️ user_document_counts table does not exist. Document counting disabled.")
+            else:
+                logger.error(f"Fallback decrement also failed: {e2}")
+            return 0
+
+
+# ==================== MESSAGE LIMIT MANAGEMENT ====================
+
+def check_message_limit(db: Session, user_id: str, daily_limit: int = 20, authorization: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[int]]:
+    """
+    Check if user has reached daily message limit.
+    Admin users bypass the limit.
+    
+    Args:
+        db: Database session
+        user_id: User identifier (Supabase UUID)
+        daily_limit: Maximum messages per day (default: 20)
+        authorization: Optional Authorization header to check for admin role
+        
+    Returns:
+        tuple: (is_allowed, cooldown_message, current_count)
+        - is_allowed: True if user can send message, False if limit reached
+        - cooldown_message: Message to display if limit reached (includes next reset time)
+        - current_count: Current message count for today
+    """
+    if not user_id:
+        # Anonymous users: no limit (or implement separate logic if needed)
+        return True, None, None
+    
+    # Check if user is admin (from token or user_id marker)
+    if user_id == "admin":
+        logger.info(f"Admin user bypassing message limit")
+        return True, None, None
+    
+    # Check if user is admin from JWT token
+    if authorization:
+        try:
+            from auth import verify_token
+            token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+            payload = verify_token(token)
+            if payload and payload.get("role") == "admin":
+                logger.info(f"Admin user bypassing message limit")
+                return True, None, None
+        except Exception as e:
+            logger.debug(f"Could not check admin status from token: {e}")
+    
+    try:
+        from datetime import datetime, timedelta, timezone
+        
+        # Get current message count for today
+        result = db.execute(
+            text("""
+                SELECT message_count 
+                FROM user_message_counts 
+                WHERE user_id = :user_id AND date = CURRENT_DATE
+            """),
+            {"user_id": user_id}
+        )
+        row = result.fetchone()
+        current_count = row[0] if row else 0
+        
+        # Check if limit reached
+        if current_count >= daily_limit:
+            # Calculate next reset time (12:00 AM tomorrow)
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            # Format date for display
+            reset_date_str = tomorrow.strftime("%B %d, %Y")
+            reset_time_str = tomorrow.strftime("%I:%M %p")
+            
+            cooldown_msg = f"Cool down! You've reached your daily limit of {daily_limit} messages. Please come back after 12:00 AM ({reset_date_str})."
+            return False, cooldown_msg, current_count
+        
+        return True, None, current_count
+        
+    except Exception as e:
+        # Check if it's a table doesn't exist error
+        error_str = str(e).lower()
+        if "does not exist" in error_str or "relation" in error_str or "undefinedtable" in error_str:
+            logger.warning(f"⚠️ user_message_counts table does not exist. Please run the migration: backend/migrations/add_message_limit.sql")
+            logger.warning(f"   Messages will work but won't be counted until migration is applied.")
+        else:
+            logger.error(f"Error checking message limit: {e}")
+        # On error, allow the message (fail open) - don't block users if table doesn't exist
+        return True, None, None
+
+
+def increment_message_count(db: Session, user_id: str) -> int:
+    """
+    Increment message count for user for today.
+    
+    Args:
+        db: Database session
+        user_id: User identifier
+        
+    Returns:
+        int: New message count after increment
+    """
+    if not user_id:
+        return 0
+    
+    try:
+        # Use PostgreSQL function to increment count atomically
+        result = db.execute(
+            text("SELECT increment_message_count(:user_id)"),
+            {"user_id": user_id}
+        )
+        new_count = result.scalar()
+        db.commit()
+        logger.info(f"Message count incremented for user {user_id}: {new_count} messages today")
+        return new_count or 0
+    except Exception as e:
+        db.rollback()
+        # Check if it's a table doesn't exist error
+        error_str = str(e).lower()
+        if "does not exist" in error_str or "relation" in error_str or "undefinedtable" in error_str:
+            logger.warning(f"⚠️ user_message_counts table does not exist. Message counting disabled until migration is run.")
+            return 0
+        
+        logger.error(f"Error incrementing message count: {e}")
+        # Try fallback: direct insert/update
+        try:
+            result = db.execute(
+                text("""
+                    INSERT INTO user_message_counts (user_id, date, message_count, last_message_at)
+                    VALUES (:user_id, CURRENT_DATE, 1, NOW())
+                    ON CONFLICT (user_id, date)
+                    DO UPDATE SET 
+                        message_count = user_message_counts.message_count + 1,
+                        last_message_at = NOW(),
+                        updated_at = NOW()
+                    RETURNING message_count
+                """),
+                {"user_id": user_id}
+            )
+            new_count = result.scalar()
+            db.commit()
+            return new_count or 0
+        except Exception as e2:
+            db.rollback()
+            error_str2 = str(e2).lower()
+            if "does not exist" in error_str2 or "relation" in error_str2 or "undefinedtable" in error_str2:
+                logger.warning(f"⚠️ user_message_counts table does not exist. Message counting disabled.")
+            else:
+                logger.error(f"Fallback increment also failed: {e2}")
+            return 0
 
 
 # ==================== PHASE 3: CHAT SESSION SYNCHRONIZATION ====================
@@ -899,7 +1510,7 @@ async def sync_chat_session(
     
     Args:
         db: Database session
-        user_id: User identifier
+        user_id: User identifier (skips sync if "admin" due to UUID type mismatch)
         chat_id: Chat session ID
         user_message: The user's message
         ai_response: The AI's response
@@ -907,6 +1518,10 @@ async def sync_chat_session(
         sources: Optional source citations
         tone: Optional tone used
     """
+    # Convert admin user_id to UUID for chat_sessions table
+    # Admin users use a special UUID to store chat sessions
+    effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+    
     try:
         import time
         
@@ -935,10 +1550,10 @@ async def sync_chat_session(
         if sources and len(sources) > 0:
             ai_msg["sources"] = sources
         
-        # Check if session exists
+        # Check if session exists (use effective_user_id for admin UUID conversion)
         result = db.execute(
             text("SELECT messages FROM chat_sessions WHERE id = :chat_id AND user_id = :user_id"),
-            {"chat_id": chat_id, "user_id": user_id}
+            {"chat_id": chat_id, "user_id": effective_user_id}
         )
         row = result.fetchone()
         
@@ -957,7 +1572,7 @@ async def sync_chat_session(
                 {
                     "messages": json.dumps(existing_messages),
                     "chat_id": chat_id,
-                    "user_id": user_id
+                    "user_id": effective_user_id
                 }
             )
             logger.info(f"Updated existing chat session {chat_id} with {len(existing_messages)} messages")
@@ -972,7 +1587,7 @@ async def sync_chat_session(
                 """),
                 {
                     "chat_id": chat_id,
-                    "user_id": user_id,
+                    "user_id": effective_user_id,
                     "title": user_message[:50] if len(user_message) > 50 else user_message,
                     "messages": json.dumps(messages)
                 }
@@ -993,7 +1608,8 @@ async def sync_chat_session(
 async def chat_with_rag_stream(
     request: ChatMessage,
     db: Session = Depends(get_db),
-    user_id: Optional[str] = Depends(get_supabase_user_id)
+    user_id: Optional[str] = Depends(get_supabase_user_id),
+    authorization: Optional[str] = Header(None)
 ):
     """
     Chat with RAG using LlamaIndex with conversation memory (streaming version).
@@ -1013,6 +1629,17 @@ async def chat_with_rag_stream(
             # For anonymous users, pass None since user_id is UUID column
             effective_user_id = user_id  # None for anonymous, UUID string for authenticated
             
+            # Check message limit for authenticated users (skip for admin)
+            if effective_user_id and effective_user_id != "admin":
+                is_allowed, cooldown_msg, current_count = check_message_limit(db, effective_user_id, daily_limit=20, authorization=authorization)
+                if not is_allowed:
+                    logger.warning(f"Message limit reached for user {effective_user_id}: {current_count} messages today")
+                    yield f"data: {json.dumps({'error': cooldown_msg or 'Daily message limit reached'})}\n\n"
+                    return
+                
+                # Increment message count before processing (skip for admin)
+                increment_message_count(db, effective_user_id)
+            
             # Initialize RAG service
             rag_service = RAGService(db)
             
@@ -1030,8 +1657,8 @@ async def chat_with_rag_stream(
                     # Process attachment into chunks
                     chunks = process_base64_attachment(base64_data, filename)
                     
-                    # Add chunks to vector store
-                    if effective_user_id:
+                    # Add chunks to vector store (skip for admin)
+                    if effective_user_id and effective_user_id != "admin":
                         rag_service.add_temporary_documents(
                             chunks=chunks,
                             filename=filename,
@@ -1061,12 +1688,23 @@ async def chat_with_rag_stream(
             language_name = language_names.get(request.language, 'English')
             
             # Build system prompt with tone and language
-            system_prompt = f"[System: Respond in a {request.tone} tone. IMPORTANT: Please respond in {language_name} language.]\n\n{rag_service._get_default_system_prompt()}"
+            language_instruction = ""
+            if request.language == 'uz':
+                language_instruction = f"\n\nCRITICAL LANGUAGE REQUIREMENT: You MUST respond entirely in Uzbek (O'zbek tili). All text, explanations, and responses must be in Uzbek. Do not mix languages."
+            elif request.language == 'ru':
+                language_instruction = f"\n\nCRITICAL LANGUAGE REQUIREMENT: You MUST respond entirely in Russian (Русский язык). All text, explanations, and responses must be in Russian. Do not mix languages."
+            elif request.language == 'en':
+                language_instruction = f"\n\nCRITICAL LANGUAGE REQUIREMENT: You MUST respond entirely in English. All text, explanations, and responses must be in English."
+            
+            system_prompt = f"[System: Respond in a {request.tone} tone. IMPORTANT: Please respond in {language_name} language.]{language_instruction}\n\n{rag_service._get_default_system_prompt()}"
             
             # Stream response with direct retrieval (uses our vector_store, not LlamaIndex PGVectorStore)
+            # For admin users, pass "admin" to search_similar_chunks so it shows all documents
+            # search_similar_chunks already handles "admin" correctly (shows all docs, respects filters)
+            rag_user_id = effective_user_id  # Keep "admin" as-is for search_similar_chunks
             token_count = 0
             for data in rag_service.chat_stream_direct(
-                user_id=effective_user_id,
+                user_id=rag_user_id,
                 chat_id=request.chat_id,
                 message=request.message,
                 selected_documents=request.selected_documents,
@@ -1090,11 +1728,13 @@ async def chat_with_rag_stream(
                     yield f"data: {payload}\n\n"
             
             # PHASE 3: Synchronize with chat_sessions after streaming completes
+            # Convert admin user_id to UUID for chat_sessions table
             try:
                 if effective_user_id:
+                    sync_user_id = get_admin_chat_user_id(effective_user_id) if effective_user_id == "admin" else effective_user_id
                     await sync_chat_session(
                         db=db,
-                        user_id=effective_user_id,
+                        user_id=sync_user_id,
                         chat_id=request.chat_id,
                         user_message=request.message,
                         ai_response=full_response,
@@ -1102,7 +1742,7 @@ async def chat_with_rag_stream(
                         sources=sources_list,
                         tone=request.tone
                     )
-                logger.info("✅ Chat session synchronized")
+                    logger.info("✅ Chat session synchronized")
             except Exception as e:
                 logger.error(f"Error synchronizing chat session: {e}")
                 # Don't fail the whole request, just log the error
@@ -1125,6 +1765,170 @@ async def chat_with_rag_stream(
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+# ==================== DOCUMENT COUNT ENDPOINT ====================
+
+@app.get("/user/document-count")
+async def get_document_count(
+    db: Session = Depends(get_db),
+    user_id: Optional[str] = Depends(get_supabase_user_id),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Get current document upload count and limit.
+    Admin users have no limit (returns limit: null).
+    
+    Returns:
+        - count: Current document count
+        - limit: Document upload limit (3 for regular users, null for admin)
+        - remaining: Remaining documents that can be uploaded
+    """
+    # Check if user is admin
+    if await is_admin_user(authorization):
+        logger.info("Admin user - returning unlimited document count")
+        return {
+            "count": 0,
+            "limit": None,
+            "remaining": None
+        }
+    
+    if not user_id or user_id == "admin":
+        # Anonymous users or admin (already handled above) have no limit
+        return {
+            "count": 0,
+            "limit": None,
+            "remaining": None
+        }
+    
+    try:
+        # Get current document count
+        result = db.execute(
+            text("""
+                SELECT document_count 
+                FROM user_document_counts 
+                WHERE user_id = :user_id
+            """),
+            {"user_id": user_id}
+        )
+        row = result.fetchone()
+        current_count = row[0] if row else 0
+        
+        upload_limit = 3
+        remaining = max(0, upload_limit - current_count)
+        
+        return {
+            "count": current_count,
+            "limit": upload_limit,
+            "remaining": remaining
+        }
+    except Exception as e:
+        # Check if it's a table doesn't exist error
+        error_str = str(e).lower()
+        if "does not exist" in error_str or "relation" in error_str or "undefinedtable" in error_str:
+            logger.warning(f"⚠️ user_document_counts table does not exist. Please run the migration: backend/migrations/add_document_upload_limit.sql")
+            # Return safe defaults - table doesn't exist yet
+            return {
+                "count": 0,
+                "limit": 3,
+                "remaining": 3
+            }
+        else:
+            logger.error(f"Error getting document count: {e}")
+            # Return safe defaults on error
+            return {
+                "count": 0,
+                "limit": 3,
+                "remaining": 3
+            }
+
+
+# ==================== MESSAGE COUNT ENDPOINT ====================
+
+@app.get("/user/message-count")
+async def get_message_count(
+    db: Session = Depends(get_db),
+    user_id: Optional[str] = Depends(get_supabase_user_id),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Get current message count for today and daily limit.
+    Admin users have no limit (returns limit: null).
+    
+    Returns:
+        - count: Current message count for today
+        - limit: Daily message limit (20 for regular users, null for admin)
+        - remaining: Remaining messages for today
+        - reset_time: When the count resets (12:00 AM tomorrow)
+    """
+    # Check if user is admin
+    if await is_admin_user(authorization):
+        logger.info("Admin user - returning unlimited message count")
+        return {
+            "count": 0,
+            "limit": None,
+            "remaining": None,
+            "reset_time": None
+        }
+    
+    if not user_id or user_id == "admin":
+        # Anonymous users or admin (already handled above) have no limit
+        return {
+            "count": 0,
+            "limit": None,
+            "remaining": None,
+            "reset_time": None
+        }
+    
+    try:
+        from datetime import datetime, timedelta, timezone
+        
+        # Get current message count for today
+        result = db.execute(
+            text("""
+                SELECT message_count 
+                FROM user_message_counts 
+                WHERE user_id = :user_id AND date = CURRENT_DATE
+            """),
+            {"user_id": user_id}
+        )
+        row = result.fetchone()
+        current_count = row[0] if row else 0
+        
+        # Calculate reset time (12:00 AM tomorrow)
+        now = datetime.now(timezone.utc)
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        daily_limit = 20
+        remaining = max(0, daily_limit - current_count)
+        
+        return {
+            "count": current_count,
+            "limit": daily_limit,
+            "remaining": remaining,
+            "reset_time": tomorrow.isoformat()
+        }
+    except Exception as e:
+        # Check if it's a table doesn't exist error
+        error_str = str(e).lower()
+        if "does not exist" in error_str or "relation" in error_str or "undefinedtable" in error_str:
+            logger.warning(f"⚠️ user_message_counts table does not exist. Please run the migration: backend/migrations/add_message_limit.sql")
+            # Return safe defaults - table doesn't exist yet
+            return {
+                "count": 0,
+                "limit": 20,
+                "remaining": 20,
+                "reset_time": None
+            }
+        else:
+            logger.error(f"Error getting message count: {e}")
+            # Return safe defaults on error
+            return {
+                "count": 0,
+                "limit": 20,
+                "remaining": 20,
+                "reset_time": None
+            }
+
+
 # ==================== CHAT HISTORY MANAGEMENT (LlamaIndex) ====================
 
 @app.get("/chat/{chat_id}/history")
@@ -1141,8 +1945,9 @@ async def get_chat_history(
         - count: Total number of messages
     """
     try:
-        # For chat history, we need an identifier - use "anonymous" as fallback for key generation
-        effective_user_id = user_id or "anonymous"
+        # For chat history, we need an identifier
+        # Admin users use "admin" as identifier for LlamaIndex memory
+        effective_user_id = user_id if user_id else "anonymous"
         
         # Initialize RAG service
         rag_service = RAGService(db)
@@ -1173,13 +1978,14 @@ async def delete_chat_history(
     This clears all messages from the LlamaIndex chat store for the specified chat.
     """
     try:
-        # For chat history deletion, use "anonymous" as fallback for key generation
-        effective_user_id = user_id or "anonymous"
+        # For chat history deletion
+        # Admin users use "admin" as identifier for LlamaIndex memory
+        effective_user_id = user_id if user_id else "anonymous"
         
         # Initialize RAG service
         rag_service = RAGService(db)
         
-# Delete chat history
+        # Delete chat history
         rag_service.delete_chat_history(effective_user_id, chat_id)
         
         logger.info(f"Deleted chat history for chat {chat_id}")
@@ -1222,6 +2028,10 @@ async def list_chat_sessions(
 ):
     """Get all chat sessions for the current user"""
     try:
+        # Convert admin user_id to UUID for chat_sessions table
+        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        logger.info(f"Listing chat sessions for user_id={user_id} (effective_user_id={effective_user_id})")
+        
         result = db.execute(
             text("""
                 SELECT id, title, messages, selected_documents, created_at, updated_at
@@ -1229,7 +2039,7 @@ async def list_chat_sessions(
                 WHERE user_id = :user_id
                 ORDER BY updated_at DESC
             """),
-            {"user_id": user_id}
+            {"user_id": effective_user_id}
         )
         
         sessions = []
@@ -1243,9 +2053,12 @@ async def list_chat_sessions(
                 "updated_at": str(row[5])
             })
         
+        logger.info(f"Found {len(sessions)} chat sessions for user_id={user_id}")
         return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
         logger.error(f"Error listing chat sessions: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail="Failed to retrieve chat sessions")
 
 
@@ -1257,6 +2070,9 @@ async def create_chat_session(
 ):
     """Create a new chat session"""
     try:
+        # Convert admin user_id to UUID for chat_sessions table
+        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        
         result = db.execute(
             text("""
                 INSERT INTO chat_sessions (user_id, title, messages, selected_documents)
@@ -1264,7 +2080,7 @@ async def create_chat_session(
                 RETURNING id, title, messages, selected_documents, created_at, updated_at
             """),
             {
-                "user_id": user_id,
+                "user_id": effective_user_id,
                 "title": request.title,
                 "messages": json.dumps(request.messages),
                 "selected_documents": request.selected_documents
@@ -1299,9 +2115,12 @@ async def update_chat_session(
 ):
     """Update an existing chat session"""
     try:
+        # Convert admin user_id to UUID for chat_sessions table
+        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        
         # Build update query dynamically based on provided fields
         updates = []
-        params = {"session_id": session_id, "user_id": user_id}
+        params = {"session_id": session_id, "user_id": effective_user_id}
         
         if request.title is not None:
             updates.append("title = :title")
@@ -1362,13 +2181,16 @@ async def delete_chat_session(
 ):
     """Delete a chat session"""
     try:
+        # Convert admin user_id to UUID for chat_sessions table
+        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        
         result = db.execute(
             text("""
                 DELETE FROM chat_sessions
                 WHERE id = :session_id AND user_id = :user_id
                 RETURNING id
             """),
-            {"session_id": session_id, "user_id": user_id}
+            {"session_id": session_id, "user_id": effective_user_id}
         )
         db.commit()
         

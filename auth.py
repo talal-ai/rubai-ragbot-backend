@@ -15,6 +15,7 @@ from sqlalchemy.sql import func
 import httpx
 import logging
 import os
+import bcrypt
 
 from database import Base, get_db
 
@@ -44,6 +45,9 @@ class User(Base):
     name = Column(String(255), nullable=True)
     avatar_url = Column(Text, nullable=True)
     google_id = Column(String(255), unique=True, nullable=True, index=True)
+    role = Column(String(20), server_default='user', nullable=False)  # 'user' or 'admin'
+    password_hash = Column(String(255), nullable=True)  # Bcrypt hashed password for admin
+    username = Column(String(255), unique=True, nullable=True, index=True)  # Username for admin login
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -68,11 +72,24 @@ class UserResponse(BaseModel):
     email: str
     name: Optional[str] = None
     avatar_url: Optional[str] = None
+    role: Optional[str] = None
+
+
+class AdminLoginRequest(BaseModel):
+    """Request model for admin login"""
+    username: str
+    password: str
+
+
+class UnifiedLoginRequest(BaseModel):
+    """Request model for unified login (auto-detects admin vs regular user)"""
+    email_or_username: str  # Can be email or username
+    password: str
 
 
 # ==================== JWT FUNCTIONS ====================
 
-def create_access_token(user_id: str, email: str) -> str:
+def create_access_token(user_id: str, email: str, role: Optional[str] = None) -> str:
     """Create JWT access token"""
     expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
     payload = {
@@ -81,6 +98,8 @@ def create_access_token(user_id: str, email: str) -> str:
         "exp": expire,
         "iat": datetime.utcnow()
     }
+    if role:
+        payload["role"] = role
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
@@ -146,6 +165,41 @@ def get_user_by_id(db: Session, user_id: int) -> Optional[User]:
 def get_user_by_google_id(db: Session, google_id: str) -> Optional[User]:
     """Get user by Google ID"""
     return db.query(User).filter(User.google_id == google_id).first()
+
+
+def get_user_by_username(db: Session, username: str) -> Optional[User]:
+    """Get user by username"""
+    return db.query(User).filter(User.username == username).first()
+
+
+def get_user_by_email_or_username(db: Session, email_or_username: str) -> Optional[User]:
+    """Get user by email or username (checks both)"""
+    # First try username
+    user = db.query(User).filter(User.username == email_or_username).first()
+    if user:
+        return user
+    # Then try email
+    return db.query(User).filter(User.email == email_or_username).first()
+
+
+def hash_password(password: str) -> str:
+    """Hash password using bcrypt"""
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify password against hash"""
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
+
+
+def is_admin(user: User) -> bool:
+    """Check if user is admin"""
+    return user.role == 'admin'
 
 
 def create_user(
@@ -259,5 +313,6 @@ def user_to_dict(user: User) -> dict:
         "id": user.id,
         "email": user.email,
         "name": user.name,
-        "avatar_url": user.avatar_url
+        "avatar_url": user.avatar_url,
+        "role": user.role
     }
