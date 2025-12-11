@@ -22,8 +22,8 @@ class OllamaClient:
             api_key: Ollama Cloud API key
             base_url: Base URL for Ollama Cloud API (default: https://ollama.com/api)
         """
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
+        self.api_key = api_key.strip()
+        self.base_url = base_url.strip().rstrip('/')
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"

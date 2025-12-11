@@ -27,8 +27,8 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
 
 # Ollama Cloud Configuration
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "ministral-3:8b-cloud")
-OLLAMA_API_BASE_URL = os.getenv("OLLAMA_API_BASE_URL", "https://ollama.com/api")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "ministral-3:8b-cloud").strip()
+OLLAMA_API_BASE_URL = os.getenv("OLLAMA_API_BASE_URL", "https://ollama.com/api").strip()
 
 # File Upload Limits
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
