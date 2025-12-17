@@ -66,13 +66,22 @@ class RAGService:
         )
         logger.info("✅ Vector store initialized")
         
-        # Initialize PostgreSQL chat store for persistent memory
-        logger.info("Initializing PostgreSQL chat store...")
-        self.chat_store = PostgresChatStore.from_uri(
-            uri=db_url,
-            table_name="llamaindex_chat_store"  # Separate table for LlamaIndex
-        )
-        logger.info("✅ Chat store initialized")
+        # Initialize chat store for persistent memory
+        # Try PostgresChatStore first, fall back to SimpleChatStore if psycopg3 is not available
+        logger.info("Initializing chat store...")
+        try:
+            self.chat_store = PostgresChatStore.from_uri(
+                uri=db_url,
+                table_name="llamaindex_chat_store"  # Separate table for LlamaIndex
+            )
+            logger.info("✅ Chat store initialized (PostgreSQL)")
+        except ImportError as e:
+            # psycopg3 not available, use in-memory chat store
+            logger.warning(f"PostgresChatStore not available (missing psycopg3): {e}")
+            logger.info("Falling back to SimpleChatStore (in-memory)")
+            from llama_index.core.storage.chat_store import SimpleChatStore
+            self.chat_store = SimpleChatStore()
+            logger.info("✅ Chat store initialized (in-memory)")
     
     def create_chat_engine(
         self, 

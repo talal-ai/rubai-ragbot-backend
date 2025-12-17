@@ -1,7 +1,3 @@
-"""
-Authentication module for RubAI Backend
-Simple Google OAuth + JWT implementation
-"""
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt  # type: ignore
@@ -10,12 +6,13 @@ from typing import Optional, Any
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import Column, String, Text, BigInteger
-from sqlalchemy.dialects.postgresql import TIMESTAMP
+from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID as PG_UUID
 from sqlalchemy.sql import func
 import httpx
 import logging
 import os
 import bcrypt
+import uuid
 
 from database import Base, get_db
 
@@ -37,17 +34,18 @@ security = HTTPBearer(auto_error=False)
 # ==================== USER MODEL ====================
 
 class User(Base):
-    """User model for authentication"""
+    """User model for authentication - uses UUID primary key for compatibility with Supabase"""
     __tablename__ = "users"
     
-    id = Column(BigInteger, primary_key=True, index=True)
+    # Use UUID as primary key to match Supabase schema and foreign key constraints
+    id = Column(PG_UUID(as_uuid=False), primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), unique=True, nullable=False, index=True)
     name = Column(String(255), nullable=True)
     avatar_url = Column(Text, nullable=True)
     google_id = Column(String(255), unique=True, nullable=True, index=True)
-    role = Column(String(20), server_default='user', nullable=False)  # 'user' or 'admin'
-    password_hash = Column(String(255), nullable=True)  # Bcrypt hashed password for admin
-    username = Column(String(255), unique=True, nullable=True, index=True)  # Username for admin login
+    role = Column(String(20), server_default='user', nullable=False)  # 'user', 'admin', or 'client'
+    password_hash = Column(String(255), nullable=True)  # Bcrypt hashed password for admin/client
+    username = Column(String(255), unique=True, nullable=True, index=True)  # Username for admin/client login
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -157,8 +155,8 @@ def get_user_by_email(db: Session, email: str) -> Optional[User]:
     return db.query(User).filter(User.email == email).first()
 
 
-def get_user_by_id(db: Session, user_id: int) -> Optional[User]:
-    """Get user by ID"""
+def get_user_by_id(db: Session, user_id: str) -> Optional[User]:
+    """Get user by ID (UUID string)"""
     return db.query(User).filter(User.id == user_id).first()
 
 
@@ -260,8 +258,8 @@ async def get_current_user_optional(
     if sub is None:
         return None
     
-    user_id = int(sub)
-    user = get_user_by_id(db, user_id)
+    # sub is now UUID string, no need to convert to int
+    user = get_user_by_id(db, sub)
     return user
 
 
@@ -295,8 +293,8 @@ async def get_current_user(
             detail="Invalid token payload"
         )
     
-    user_id = int(sub)
-    user = get_user_by_id(db, user_id)
+    # sub is now UUID string, no need to convert to int
+    user = get_user_by_id(db, sub)
     
     if not user:
         raise HTTPException(

@@ -159,6 +159,34 @@ async def is_admin_user(authorization: Optional[str] = Header(None)) -> bool:
         return False
 
 
+async def is_privileged_user(authorization: Optional[str] = Header(None)) -> bool:
+    """Check if the current user is admin OR client (has no limits)"""
+    if not authorization:
+        return False
+    
+    try:
+        from auth import verify_token
+        token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+        payload = verify_token(token)
+        return payload and payload.get("role") in ["admin", "client"]
+    except:
+        return False
+
+
+def get_user_role_from_token(authorization: Optional[str]) -> Optional[str]:
+    """Extract user role from JWT token"""
+    if not authorization:
+        return None
+    
+    try:
+        from auth import verify_token
+        token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+        payload = verify_token(token)
+        return payload.get("role") if payload else None
+    except:
+        return None
+
+
 async def require_supabase_user(authorization: Optional[str] = Header(None)) -> str:
     """
     Require a valid Supabase user. Raises 401 if not authenticated.
@@ -178,6 +206,39 @@ def get_admin_chat_user_id(admin_user_id: str) -> str:
     # Use a fixed UUID for all admin users: 00000000-0000-0000-0000-000000000001
     # This allows admin chat sessions to be stored in chat_sessions table
     return "00000000-0000-0000-0000-000000000001"
+
+def get_backend_user_uuid(user_id: str) -> str:
+    """
+    Convert backend user_id (integer from our users table) to a UUID format.
+    Supabase UUIDs are passed through unchanged.
+    
+    Backend users (admin, client) have integer IDs like "4", "5", etc.
+    These need to be converted to valid UUIDs for tables like chat_sessions.
+    
+    Format: 00000000-0000-0000-0000-{12-digit padded user_id}
+    Example: user_id "4" -> "00000000-0000-0000-0000-000000000004"
+    """
+    if not user_id:
+        return user_id
+    
+    # Check if it's already a UUID (contains hyphens and is 36 chars)
+    if len(user_id) == 36 and user_id.count('-') == 4:
+        return user_id
+    
+    # Special case for "admin" marker (keep existing behavior)
+    if user_id == "admin":
+        return "00000000-0000-0000-0000-000000000001"
+    
+    # Try to convert integer ID to UUID format
+    try:
+        user_id_int = int(user_id)
+        # Convert to padded 12-digit string and create UUID
+        padded_id = str(user_id_int).zfill(12)
+        return f"00000000-0000-0000-0000-{padded_id}"
+    except (ValueError, TypeError):
+        # If it's not an integer, return as-is (might be some other format)
+        logger.warning(f"Could not convert user_id to UUID: {user_id}")
+        return user_id
 
 app = FastAPI(  # type: ignore[call-arg]
     title="RubAI Backend API",
@@ -469,17 +530,17 @@ async def admin_login(request: AdminLoginRequest, db: Session = Depends(get_db))
 @app.post("/auth/login", response_model=TokenResponse)
 async def unified_login(request: UnifiedLoginRequest, db: Session = Depends(get_db)):
     """
-    Unified login endpoint that auto-detects admin vs regular users.
-    - If email/username is an admin: authenticates with password hash and returns admin token
-    - If not admin: returns error indicating to use Supabase auth (frontend handles this)
+    Unified login endpoint that handles admin and client users.
+    - If email/username is an admin or client: authenticates with password hash and returns token
+    - If regular user: returns error indicating to use Supabase auth (frontend handles this)
     This keeps the role separation hidden from users.
     """
     try:
         # Check if user exists by email or username
         user = get_user_by_email_or_username(db, request.email_or_username)
         
-        # If user exists and is admin, authenticate as admin
-        if user and user.role == 'admin':
+        # If user exists and has password-based role (admin or client), authenticate
+        if user and user.role in ['admin', 'client']:
             # Verify password
             if not user.password_hash:
                 raise HTTPException(
@@ -493,17 +554,17 @@ async def unified_login(request: UnifiedLoginRequest, db: Session = Depends(get_
                     detail="Invalid email or password"
                 )
             
-            # Create admin JWT token
+            # Create JWT token with user's role
             access_token = create_access_token(str(user.id), str(user.email), user.role)
             
-            logger.info(f"Admin authenticated via unified login: {user.username or user.email}")
+            logger.info(f"{user.role.title()} authenticated via unified login: {user.username or user.email}")
             
             return TokenResponse(
                 access_token=access_token,
                 user=user_to_dict(user)
             )
         
-        # If not admin, return error that frontend will catch and use Supabase auth
+        # If not admin/client, return error that frontend will catch and use Supabase auth
         # We use a generic error message so users don't know about role separation
         raise HTTPException(
             status_code=401,
@@ -620,6 +681,57 @@ async def upload_document(
             if not is_allowed:
                 logger.warning(f"Document upload limit reached for user {user_id}: {current_count} documents")
                 raise HTTPException(status_code=429, detail=error_msg or "Document upload limit reached")
+        
+        # Ensure user exists in local users table (for foreign key constraint)
+        if user_id and user_id != "admin":
+            try:
+                # Check if user exists in local users table
+                existing_user = db.execute(
+                    text("SELECT 1 FROM users WHERE id = :user_id LIMIT 1"),
+                    {"user_id": user_id}
+                ).first()
+                
+                if not existing_user:
+                    # Get user data from profiles table first, then auth.users as fallback
+                    user_email = f"{user_id}@unknown.com"
+                    user_name = None
+                    
+                    try:
+                        # First check profiles table (where Supabase Auth users are automatically created)
+                        profile_user = db.execute(
+                            text("SELECT email, full_name FROM profiles WHERE id = :user_id LIMIT 1"),
+                            {"user_id": user_id}
+                        ).first()
+                        
+                        if profile_user:
+                            user_email = profile_user.email or user_email
+                            user_name = profile_user.full_name
+                            logger.info(f"Found user in profiles table: {user_email}")
+                        else:
+                            # Fallback to auth.users if not in profiles
+                            auth_user = db.execute(
+                                text("SELECT email FROM auth.users WHERE id = :user_id LIMIT 1"),
+                                {"user_id": user_id}
+                            ).first()
+                            if auth_user:
+                                user_email = auth_user.email or user_email
+                                logger.info(f"Found user in auth.users table: {user_email}")
+                    except Exception as e:
+                        logger.warning(f"Error fetching user data: {e}")
+                    
+                    # Create user in local users table
+                    db.execute(
+                        text("""
+                        INSERT INTO users (id, email, name, role, created_at) 
+                        VALUES (:user_id, :email, :name, 'user', NOW())
+                        ON CONFLICT (id) DO NOTHING
+                        """),
+                        {"user_id": user_id, "email": user_email, "name": user_name}
+                    )
+                    db.commit()
+                    logger.info(f"Created local user record for {user_id} ({user_email})")
+            except Exception as e:
+                logger.warning(f"Failed to ensure user exists: {e}")
         
         # Admin users store documents as global (user_id=NULL), so check for existing global documents
         # Regular users check for their own documents
@@ -764,8 +876,13 @@ async def list_documents(
     """
     try:
         # Admin users see all documents (pass None to get_all_documents)
-        # Also handle case where user_id is "admin" string
-        effective_user_id = None if (await is_admin_user(authorization) or user_id == "admin") else user_id
+        if await is_admin_user(authorization) or user_id == "admin":
+            effective_user_id = None
+        else:
+            # Client users and regular users see their own + global docs
+            # Convert integer user_id to UUID format for database queries
+            effective_user_id = get_backend_user_uuid(user_id) if user_id else None
+        
         documents = get_all_documents(db, user_id=effective_user_id, category=category, language=language)
         return {"documents": documents, "count": len(documents)}
     except Exception as e:
@@ -1076,7 +1193,7 @@ async def chat_with_rag(
                 raise HTTPException(status_code=429, detail=cooldown_msg or "Daily message limit reached")
             
             # Increment message count before processing (skip for admin)
-            increment_message_count(db, effective_user_id)
+            increment_message_count(db, get_backend_user_uuid(effective_user_id))
         
         # Initialize RAG service
         rag_service = RAGService(db)
@@ -1128,7 +1245,7 @@ async def chat_with_rag(
         # Convert admin user_id to UUID for chat_sessions table
         try:
             if effective_user_id:
-                sync_user_id = get_admin_chat_user_id(effective_user_id) if effective_user_id == "admin" else effective_user_id
+                sync_user_id = get_backend_user_uuid(effective_user_id)
                 await sync_chat_session(
                     db=db,
                     user_id=sync_user_id,
@@ -1183,14 +1300,14 @@ def check_document_upload_limit(db: Session, user_id: str, upload_limit: int = 3
         logger.info(f"Admin user bypassing document upload limit")
         return True, None, None
     
-    # Check if user is admin from JWT token
+    # Check if user is admin or client from JWT token
     if authorization:
         try:
             from auth import verify_token
             token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
             payload = verify_token(token)
-            if payload and payload.get("role") == "admin":
-                logger.info(f"Admin user bypassing document upload limit")
+            if payload and payload.get("role") in ["admin", "client"]:
+                logger.info(f"{payload.get('role').title()} user bypassing document upload limit")
                 return True, None, None
         except Exception as e:
             logger.debug(f"Could not check admin status from token: {e}")
@@ -1380,8 +1497,8 @@ def check_message_limit(db: Session, user_id: str, daily_limit: int = 20, author
             from auth import verify_token
             token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
             payload = verify_token(token)
-            if payload and payload.get("role") == "admin":
-                logger.info(f"Admin user bypassing message limit")
+            if payload and payload.get("role") in ["admin", "client"]:
+                logger.info(f"{payload.get('role').title()} user bypassing message limit")
                 return True, None, None
         except Exception as e:
             logger.debug(f"Could not check admin status from token: {e}")
@@ -1520,7 +1637,7 @@ async def sync_chat_session(
     """
     # Convert admin user_id to UUID for chat_sessions table
     # Admin users use a special UUID to store chat sessions
-    effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+    effective_user_id = get_backend_user_uuid(user_id)
     
     try:
         import time
@@ -1638,7 +1755,7 @@ async def chat_with_rag_stream(
                     return
                 
                 # Increment message count before processing (skip for admin)
-                increment_message_count(db, effective_user_id)
+                increment_message_count(db, get_backend_user_uuid(effective_user_id))
             
             # Initialize RAG service
             rag_service = RAGService(db)
@@ -1731,7 +1848,7 @@ async def chat_with_rag_stream(
             # Convert admin user_id to UUID for chat_sessions table
             try:
                 if effective_user_id:
-                    sync_user_id = get_admin_chat_user_id(effective_user_id) if effective_user_id == "admin" else effective_user_id
+                    sync_user_id = get_backend_user_uuid(effective_user_id)
                     await sync_chat_session(
                         db=db,
                         user_id=sync_user_id,
@@ -1775,16 +1892,16 @@ async def get_document_count(
 ):
     """
     Get current document upload count and limit.
-    Admin users have no limit (returns limit: null).
+    Admin and client users have no limit (returns limit: null).
     
     Returns:
         - count: Current document count
-        - limit: Document upload limit (3 for regular users, null for admin)
+        - limit: Document upload limit (3 for regular users, null for admin/client)
         - remaining: Remaining documents that can be uploaded
     """
-    # Check if user is admin
-    if await is_admin_user(authorization):
-        logger.info("Admin user - returning unlimited document count")
+    # Check if user is admin or client (privileged users have no limits)
+    if await is_privileged_user(authorization):
+        logger.info("Privileged user - returning unlimited document count")
         return {
             "count": 0,
             "limit": None,
@@ -1800,6 +1917,9 @@ async def get_document_count(
         }
     
     try:
+        # Convert user_id to UUID format for database query
+        effective_user_id = get_backend_user_uuid(user_id)
+        
         # Get current document count
         result = db.execute(
             text("""
@@ -1807,7 +1927,7 @@ async def get_document_count(
                 FROM user_document_counts 
                 WHERE user_id = :user_id
             """),
-            {"user_id": user_id}
+            {"user_id": effective_user_id}
         )
         row = result.fetchone()
         current_count = row[0] if row else 0
@@ -1851,17 +1971,17 @@ async def get_message_count(
 ):
     """
     Get current message count for today and daily limit.
-    Admin users have no limit (returns limit: null).
+    Admin and client users have no limit (returns limit: null).
     
     Returns:
         - count: Current message count for today
-        - limit: Daily message limit (20 for regular users, null for admin)
+        - limit: Daily message limit (20 for regular users, null for admin/client)
         - remaining: Remaining messages for today
         - reset_time: When the count resets (12:00 AM tomorrow)
     """
-    # Check if user is admin
-    if await is_admin_user(authorization):
-        logger.info("Admin user - returning unlimited message count")
+    # Check if user is admin or client (privileged users have no limits)
+    if await is_privileged_user(authorization):
+        logger.info("Privileged user - returning unlimited message count")
         return {
             "count": 0,
             "limit": None,
@@ -1881,6 +2001,9 @@ async def get_message_count(
     try:
         from datetime import datetime, timedelta, timezone
         
+        # Convert user_id to UUID format for database query
+        effective_user_id = get_backend_user_uuid(user_id)
+        
         # Get current message count for today
         result = db.execute(
             text("""
@@ -1888,7 +2011,7 @@ async def get_message_count(
                 FROM user_message_counts 
                 WHERE user_id = :user_id AND date = CURRENT_DATE
             """),
-            {"user_id": user_id}
+            {"user_id": effective_user_id}
         )
         row = result.fetchone()
         current_count = row[0] if row else 0
@@ -2029,7 +2152,7 @@ async def list_chat_sessions(
     """Get all chat sessions for the current user"""
     try:
         # Convert admin user_id to UUID for chat_sessions table
-        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        effective_user_id = get_backend_user_uuid(user_id)
         logger.info(f"Listing chat sessions for user_id={user_id} (effective_user_id={effective_user_id})")
         
         result = db.execute(
@@ -2071,7 +2194,7 @@ async def create_chat_session(
     """Create a new chat session"""
     try:
         # Convert admin user_id to UUID for chat_sessions table
-        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        effective_user_id = get_backend_user_uuid(user_id)
         
         result = db.execute(
             text("""
@@ -2116,7 +2239,7 @@ async def update_chat_session(
     """Update an existing chat session"""
     try:
         # Convert admin user_id to UUID for chat_sessions table
-        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        effective_user_id = get_backend_user_uuid(user_id)
         
         # Build update query dynamically based on provided fields
         updates = []
@@ -2182,7 +2305,7 @@ async def delete_chat_session(
     """Delete a chat session"""
     try:
         # Convert admin user_id to UUID for chat_sessions table
-        effective_user_id = get_admin_chat_user_id(user_id) if user_id == "admin" else user_id
+        effective_user_id = get_backend_user_uuid(user_id)
         
         result = db.execute(
             text("""
@@ -2319,6 +2442,502 @@ async def debug_document_sources(
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail="Failed to retrieve debug information")
+
+# ==================== ADMIN DASHBOARD ENDPOINTS ====================
+
+@app.get("/admin/stats")
+async def get_admin_stats(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Get admin dashboard statistics.
+    Only accessible by admin users.
+    """
+    # Check if user is admin
+    if not await is_admin_user(authorization):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Total users from local database
+        local_users = db.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
+        
+        # Total users from Supabase profiles
+        try:
+            supabase_users = db.execute(text("SELECT COUNT(*) FROM profiles WHERE email IS NOT NULL")).scalar() or 0
+        except:
+            supabase_users = 0
+        
+        # Combine for total (this may have duplicates, but gives overall system user count)
+        total_users = local_users + supabase_users
+        
+        # Active users (sent message in last 24h)
+        active_users_24h = db.execute(text("""
+            SELECT COUNT(DISTINCT user_id) 
+            FROM user_message_counts 
+            WHERE last_message_at > NOW() - INTERVAL '24 hours'
+        """)).scalar()
+        
+        # Total messages today
+        messages_today = db.execute(text("""
+            SELECT COALESCE(SUM(message_count), 0) 
+            FROM user_message_counts 
+            WHERE date = CURRENT_DATE
+        """)).scalar()
+        
+        # Total messages all time
+        messages_total = db.execute(text("""
+            SELECT COALESCE(SUM(message_count), 0) 
+            FROM user_message_counts
+        """)).scalar()
+        
+        # Total documents
+        total_documents = db.execute(text("""
+            SELECT COUNT(DISTINCT filename) FROM documents
+        """)).scalar()
+        
+        # Documents uploaded today
+        docs_today = db.execute(text("""
+            SELECT COUNT(DISTINCT filename) 
+            FROM documents 
+            WHERE DATE(created_at) = CURRENT_DATE
+        """)).scalar()
+        
+        # Total chat sessions
+        total_chats = db.execute(text("SELECT COUNT(*) FROM chat_sessions")).scalar()
+        
+        # Chats created today
+        chats_today = db.execute(text("""
+            SELECT COUNT(*) 
+            FROM chat_sessions 
+            WHERE DATE(created_at) = CURRENT_DATE
+        """)).scalar()
+        
+        logger.info(f"Admin stats fetched successfully")
+        
+        return {
+            "users": {
+                "total": total_users or 0,
+                "active_24h": active_users_24h or 0,
+            },
+            "messages": {
+                "today": messages_today or 0,
+                "total": messages_total or 0,
+            },
+            "documents": {
+                "total": total_documents or 0,
+                "uploaded_today": docs_today or 0,
+            },
+            "chats": {
+                "total": total_chats or 0,
+                "created_today": chats_today or 0,
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error fetching admin stats: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to fetch statistics")
+
+
+@app.get("/admin/users")
+async def get_admin_users(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+    limit: int = Query(100, le=200),
+    offset: int = Query(0, ge=0)
+):
+    """
+    Get list of ALL users from both local database and Supabase auth with their activity stats.
+    Only accessible by admin users.
+    """
+    if not await is_admin_user(authorization):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Fetch local database users
+        local_users = db.execute(text("""
+            SELECT 
+                u.id,
+                u.email,
+                u.name,
+                u.role,
+                u.created_at,
+                COALESCE(umc.message_count, 0) as messages_today,
+                COALESCE(umc_total.total_messages, 0) as total_messages,
+                COALESCE(doc_count.count, 0) as total_documents,
+                COALESCE(chat_count.count, 0) as total_chats,
+                'local' as source
+            FROM users u
+            LEFT JOIN user_message_counts umc 
+                ON u.id::text = umc.user_id::text AND umc.date = CURRENT_DATE
+            LEFT JOIN (
+                SELECT user_id, SUM(message_count) as total_messages
+                FROM user_message_counts
+                GROUP BY user_id
+            ) umc_total ON u.id::text = umc_total.user_id::text
+            LEFT JOIN (
+                SELECT user_id, COUNT(DISTINCT filename) as count
+                FROM documents
+                WHERE user_id IS NOT NULL
+                GROUP BY user_id
+            ) doc_count ON u.id::text = doc_count.user_id::text
+            LEFT JOIN (
+                SELECT user_id, COUNT(*) as count
+                FROM chat_sessions
+                GROUP BY user_id
+            ) chat_count ON u.id::text = chat_count.user_id::text
+            ORDER BY u.created_at DESC
+        """)).fetchall()
+        
+        users = []
+        seen_emails = set()
+        
+        # Add local users
+        for row in local_users:
+            users.append({
+                "id": str(row[0]),
+                "email": row[1],
+                "name": row[2],
+                "role": row[3],
+                "created_at": str(row[4]),
+                "messages_today": row[5],
+                "total_messages": row[6],
+                "total_documents": row[7],
+                "total_chats": row[8],
+                "source": row[9]
+            })
+            seen_emails.add(row[1])
+        
+        # Fetch Supabase auth users
+        try:
+            from supabase_storage import get_supabase_client
+            supabase = get_supabase_client()
+            
+            # Get all Supabase auth users (admin endpoint requires service role key)
+            # Since we're using anon key, we'll query the profiles table instead
+            # which mirrors auth.users data
+            supabase_users_result = db.execute(text("""
+                SELECT 
+                    p.id,
+                    p.email,
+                    p.full_name as name,
+                    'user' as role,
+                    p.created_at,
+                    COALESCE(umc.message_count, 0) as messages_today,
+                    COALESCE(umc_total.total_messages, 0) as total_messages,
+                    COALESCE(doc_count.count, 0) as total_documents,
+                    COALESCE(chat_count.count, 0) as total_chats
+                FROM profiles p
+                LEFT JOIN user_message_counts umc 
+                    ON p.id::text = umc.user_id::text AND umc.date = CURRENT_DATE
+                LEFT JOIN (
+                    SELECT user_id, SUM(message_count) as total_messages
+                    FROM user_message_counts
+                    GROUP BY user_id
+                ) umc_total ON p.id::text = umc_total.user_id::text
+                LEFT JOIN (
+                    SELECT user_id, COUNT(DISTINCT filename) as count
+                    FROM documents
+                    WHERE user_id IS NOT NULL
+                    GROUP BY user_id
+                ) doc_count ON p.id::text = doc_count.user_id::text
+                LEFT JOIN (
+                    SELECT user_id, COUNT(*) as count
+                    FROM chat_sessions
+                    GROUP BY user_id
+                ) chat_count ON p.id::text = chat_count.user_id::text
+                WHERE p.email IS NOT NULL
+                ORDER BY p.created_at DESC
+            """)).fetchall()
+            
+            # Add Supabase users (avoid duplicates)
+            for row in supabase_users_result:
+                email = row[1]
+                if email not in seen_emails:
+                    users.append({
+                        "id": str(row[0]),
+                        "email": email,
+                        "name": row[2],
+                        "role": row[3],
+                        "created_at": str(row[4]),
+                        "messages_today": row[5],
+                        "total_messages": row[6],
+                        "total_documents": row[7],
+                        "total_chats": row[8],
+                        "source": "supabase"
+                    })
+                    seen_emails.add(email)
+        except Exception as e:
+            logger.warning(f"Could not fetch Supabase users: {e}")
+            # Continue with local users only
+        
+        # Sort by created_at (most recent first)
+        users.sort(key=lambda x: x["created_at"], reverse=True)
+        
+        # Apply pagination
+        total_count = len(users)
+        paginated_users = users[offset:offset + limit]
+        
+        logger.info(f"Admin users list fetched: {len(paginated_users)} users (total: {total_count})")
+        
+        return {
+            "users": paginated_users,
+            "count": len(paginated_users),
+            "total": total_count,
+            "limit": limit,
+            "offset": offset
+        }
+    except Exception as e:
+        logger.error(f"Error fetching users: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+
+@app.get("/admin/analytics/growth")
+async def get_user_growth_analytics(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+    days: int = Query(30, le=90)
+):
+    """
+    Get user growth and activity trends over time.
+    Only accessible by admin users.
+    """
+    if not await is_admin_user(authorization):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # User signups per day (last N days)
+        user_growth = db.execute(text("""
+            SELECT 
+                DATE(created_at) as date,
+                COUNT(*) as new_users
+            FROM users
+            WHERE created_at > CURRENT_DATE - INTERVAL ':days days'
+            GROUP BY DATE(created_at)
+            ORDER BY date DESC
+            LIMIT :days
+        """), {"days": days}).fetchall()
+        
+        # Message activity per day
+        message_activity = db.execute(text("""
+            SELECT 
+                date,
+                SUM(message_count) as total_messages,
+                COUNT(DISTINCT user_id) as active_users
+            FROM user_message_counts
+            WHERE date > CURRENT_DATE - INTERVAL ':days days'
+            GROUP BY date
+            ORDER BY date DESC
+            LIMIT :days
+        """), {"days": days}).fetchall()
+        
+        return {
+            "user_growth": [
+                {"date": str(row[0]), "new_users": row[1]}
+                for row in user_growth
+            ],
+            "message_activity": [
+                {
+                    "date": str(row[0]),
+                    "total_messages": row[1],
+                    "active_users": row[2]
+                }
+                for row in message_activity
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching growth analytics: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to fetch growth analytics")
+
+
+@app.get("/admin/analytics/documents")
+async def get_document_analytics(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Get document upload analytics by category.
+    Only accessible by admin users.
+    """
+    if not await is_admin_user(authorization):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Documents by category
+        doc_categories = db.execute(text("""
+            SELECT 
+                COALESCE(metadata->>'category', 'uncategorized') as category,
+                COUNT(DISTINCT filename) as doc_count,
+                COUNT(*) as chunk_count
+            FROM documents
+            GROUP BY metadata->>'category'
+            ORDER BY doc_count DESC
+        """)).fetchall()
+        
+        # Recent uploads (last 10)
+        recent_uploads = db.execute(text("""
+            SELECT DISTINCT ON (filename)
+                filename,
+                metadata->>'category' as category,
+                created_at,
+                user_id
+            FROM documents
+            ORDER BY filename, created_at DESC
+            LIMIT 10
+        """)).fetchall()
+        
+        return {
+            "by_category": [
+                {
+                    "category": row[0] or "uncategorized",
+                    "document_count": row[1],
+                    "chunk_count": row[2]
+                }
+                for row in doc_categories
+            ],
+            "recent_uploads": [
+                {
+                    "filename": row[0],
+                    "category": row[1] or "uncategorized",
+                    "uploaded_at": str(row[2]),
+                    "user_id": str(row[3]) if row[3] else "global"
+                }
+                for row in recent_uploads
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching document analytics: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to fetch document analytics")
+
+
+@app.get("/admin/analytics/activity")
+async def get_recent_activity(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+    limit: int = Query(20, le=100)
+):
+    """
+    Get recent activity timeline across the system.
+    Only accessible by admin users.
+    """
+    if not await is_admin_user(authorization):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Combine recent activities from multiple sources
+        activities = []
+        
+        # Recent user signups
+        recent_users = db.execute(text("""
+            SELECT 
+                'user_signup' as type,
+                email as detail,
+                created_at as timestamp,
+                name as extra
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """), {"limit": limit // 2}).fetchall()
+        
+        for row in recent_users:
+            activities.append({
+                "type": row[0],
+                "detail": row[1],
+                "timestamp": str(row[2]),
+                "extra": row[3]
+            })
+        
+        # Recent document uploads
+        recent_docs = db.execute(text("""
+            SELECT DISTINCT ON (filename)
+                'document_upload' as type,
+                filename as detail,
+                created_at as timestamp,
+                metadata->>'category' as extra
+            FROM documents
+            ORDER BY filename, created_at DESC
+            LIMIT :limit
+        """), {"limit": limit // 2}).fetchall()
+        
+        for row in recent_docs:
+            activities.append({
+                "type": row[0],
+                "detail": row[1],
+                "timestamp": str(row[2]),
+                "extra": row[3]
+            })
+        
+        # Sort by timestamp
+        activities.sort(key=lambda x: x["timestamp"], reverse=True)
+        
+        return {
+            "activities": activities[:limit]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching recent activity: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to fetch activity")
+
+
+@app.get("/admin/system/health")
+async def get_system_health(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Get system health metrics (database, storage, etc.).
+    Only accessible by admin users.
+    """
+    if not await is_admin_user(authorization):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Database stats
+        db_stats = db.execute(text("""
+            SELECT 
+                pg_database_size(current_database()) as db_size,
+                (SELECT count(*) FROM pg_stat_activity WHERE state = 'active') as active_connections
+        """)).fetchone()
+        
+        # Table sizes
+        table_stats = db.execute(text("""
+            SELECT 
+                'users' as table_name,
+                COUNT(*) as row_count
+            FROM users
+            UNION ALL
+            SELECT 'documents', COUNT(*) FROM documents
+            UNION ALL
+            SELECT 'chat_sessions', COUNT(*) FROM chat_sessions
+            UNION ALL
+            SELECT 'user_message_counts', COUNT(*) FROM user_message_counts
+        """)).fetchall()
+        
+        return {
+            "database": {
+                "size_bytes": db_stats[0] if db_stats else 0,
+                "size_mb": round((db_stats[0] / (1024 * 1024)), 2) if db_stats else 0,
+                "active_connections": db_stats[1] if db_stats else 0,
+                "status": "healthy"
+            },
+            "tables": [
+                {"name": row[0], "row_count": row[1]}
+                for row in table_stats
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error fetching system health: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Failed to fetch system health")
 
 
 if __name__ == "__main__":
